@@ -698,8 +698,8 @@ github.com/cncf/xds/go v0.0.0-20230310173818-32f1caf87195/go.mod h1:eXthEFrGJvWH
 github.com/cncf/xds/go v0.0.0-20240423153145-555b57ec207b h1:ga8SEFjZ60pxLcmhnThWgvH2wg8376yUJmPhEH4H3kw=
 github.com/cncf/xds/go v0.0.0-20240423153145-555b57ec207b/go.mod h1:W+zGtBO5Y1IgJhy4+A9GOqVhqLpfZi+vwmdNXUehLA8=
 github.com/codahale/hdrhistogram v0.0.0-20161010025455-3a0bb77429bd/go.mod h1:sE/e/2PUdi/liOCUjSTXgM1o87ZssimdTWN964YiIeI=
-github.com/conduktor/prometheus v0.54.2-0.20240926090342-14f5e8403550 h1:9Kn8sFv99FBQJwfJ8H/viFz/dlVvTdhVWbGNnO5Z0Zk=
-github.com/conduktor/prometheus v0.54.2-0.20240926090342-14f5e8403550/go.mod h1:pZDmV7U4ZtBITWpAxDbx3F2ZRpbEH/+BzUjjXN4fg2k=
+github.com/conduktor/prometheus v0.54.2-0.20250218132958-304815a94488 h1:oamBfrykIE9mS7jei0UeEysSmb1LfeR3XkPezDyztHs=
+github.com/conduktor/prometheus v0.54.2-0.20250218132958-304815a94488/go.mod h1:M8jRNQnV/MLWEKryHyubolKKYlE2paofNfFmGfcTJR8=
 github.com/coreos/go-semver v0.3.0 h1:wkHLiw0WNATZnSG7epLsujiMCgPAc9xhjJ4tgnAxmfM=
 github.com/coreos/go-semver v0.3.0/go.mod h1:nnelYz7RCh+5ahJtPPxZlU+153eP4D4r3EedlOD2RNk=
 github.com/coreos/go-systemd/v22 v22.3.2/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=

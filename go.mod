@@ -246,7 +246,7 @@ require (
 
 // Use Conduktor fork of prometheus based on branch cdk-2.54
 // to update run `go get github.com/conduktor/prometheus@cdk-2.54`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20240926090342-14f5e8403550
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20250218132958-304815a94488
 
 // Override since git.apache.org is down.  The docs say to fetch from github.
 replace git.apache.org/thrift.git => github.com/apache/thrift v0.0.0-20180902110319-2566ecd5d999
