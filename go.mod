@@ -145,7 +145,7 @@ require (
 	github.com/goccy/go-json v0.10.3 // indirect
 	github.com/gofrs/uuid v4.4.0+incompatible // indirect
 	github.com/gogo/googleapis v1.4.0 // indirect
-	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/pprof v0.0.0-20240711041743-f6c9dda6c6da // indirect
@@ -246,7 +246,7 @@ require (
 
 // Use Conduktor fork of prometheus based on branch cdk-2.54
 // to update run `go get github.com/conduktor/prometheus@cdk-2.54`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20250319101033-495b3a65c4e6
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20250324152448-0cbe01c90741
 
 // Override since git.apache.org is down.  The docs say to fetch from github.
 replace git.apache.org/thrift.git => github.com/apache/thrift v0.0.0-20180902110319-2566ecd5d999
