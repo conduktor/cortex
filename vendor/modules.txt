@@ -826,8 +826,8 @@ github.com/prometheus/exporter-toolkit/web
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/prometheus/prometheus v0.54.2-0.20240926090342-14f5e8403550 => github.com/conduktor/prometheus v0.54.2-0.20251105151443-83d39b13d163
-## explicit; go 1.25.3
+# github.com/prometheus/prometheus v0.54.2-0.20240926090342-14f5e8403550 => github.com/conduktor/prometheus v0.54.2-0.20251209162239-bcf9410970e6
+## explicit; go 1.25.5
 github.com/prometheus/prometheus/config
 github.com/prometheus/prometheus/discovery
 github.com/prometheus/prometheus/discovery/dns
@@ -1538,7 +1538,7 @@ k8s.io/klog/v2/internal/sloghandler
 # k8s.io/utils v0.0.0-20240502163921-fe8a2dddb1d0
 ## explicit; go 1.18
 k8s.io/utils/clock
-# github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20251105151443-83d39b13d163
+# github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20251209162239-bcf9410970e6
 # git.apache.org/thrift.git => github.com/apache/thrift v0.0.0-20180902110319-2566ecd5d999
 # github.com/gocql/gocql => github.com/grafana/gocql v0.0.0-20200605141915-ba5dc39ece85
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20220714140823-09ffed8adbbe
