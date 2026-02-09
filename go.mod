@@ -1,6 +1,6 @@
 module github.com/cortexproject/cortex
 
-go 1.25.5
+go 1.25.7
 
 require (
 	github.com/Masterminds/squirrel v1.5.4
@@ -244,7 +244,7 @@ require (
 
 // Use Conduktor fork of prometheus based on branch cdk-2.54
 // to update run `go get github.com/conduktor/prometheus@cdk-2.54`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20251209162239-bcf9410970e6
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.54.2-0.20260209120136-bba60f8cb419
 
 // Override since git.apache.org is down.  The docs say to fetch from github.
 replace git.apache.org/thrift.git => github.com/apache/thrift v0.0.0-20180902110319-2566ecd5d999
