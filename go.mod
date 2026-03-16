@@ -274,3 +274,7 @@ replace gopkg.in/alecthomas/kingpin.v2 => github.com/alecthomas/kingpin v1.3.8-0
 
 // Pin kuberesolver/v5 to support new grpc version. Need to upgrade kuberesolver version on weaveworks/common.
 replace github.com/sercand/kuberesolver/v4 => github.com/sercand/kuberesolver/v5 v5.1.1
+
+// Pin objstore to commit that removes deprecated gRPC experimental.WithRecvBufferPool/grpc.NewSharedBufferPool
+// APIs removed in grpc v1.78+. Buffer pooling is now default in grpc v1.78+.
+replace github.com/thanos-io/objstore v0.0.0-20240622095743-1afe5d4bc3cd => github.com/thanos-io/objstore v0.0.0-20240828151628-f06322381f09
