@@ -6,6 +6,7 @@ package engine
 import (
 	"math"
 
+	"github.com/facette/natsort"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -20,10 +21,25 @@ const (
 
 type resultSorter interface {
 	comparer(samples *promql.Vector) func(i, j int) bool
+	keepHistograms() bool
 }
 
 type sortFuncResultSort struct {
 	sortOrder sortOrder
+}
+
+func (s sortFuncResultSort) keepHistograms() bool {
+	return false
+}
+
+type sortByLabelFuncResult struct {
+	sortingLabels []string
+
+	sortOrder sortOrder
+}
+
+func (s sortByLabelFuncResult) keepHistograms() bool {
+	return false
 }
 
 type aggregateResultSort struct {
@@ -36,6 +52,24 @@ type aggregateResultSort struct {
 type noSortResultSort struct {
 }
 
+func (a aggregateResultSort) keepHistograms() bool {
+	return true
+}
+
+func (s noSortResultSort) keepHistograms() bool {
+	return true
+}
+
+func extractSortingLabels(f *parser.Call) []string {
+	args := f.Args[1:]
+
+	res := make([]string, 0)
+	for i := range args {
+		res = append(res, args[i].(*parser.StringLiteral).Val)
+	}
+	return res
+}
+
 func newResultSort(expr parser.Expr) resultSorter {
 	switch texpr := expr.(type) {
 	case *parser.Call:
@@ -44,6 +78,10 @@ func newResultSort(expr parser.Expr) resultSorter {
 			return sortFuncResultSort{sortOrder: sortOrderAsc}
 		case "sort_desc":
 			return sortFuncResultSort{sortOrder: sortOrderDesc}
+		case "sort_by_label":
+			return sortByLabelFuncResult{sortOrder: sortOrderAsc, sortingLabels: extractSortingLabels(texpr)}
+		case "sort_by_label_desc":
+			return sortByLabelFuncResult{sortOrder: sortOrderDesc, sortingLabels: extractSortingLabels(texpr)}
 		}
 	case *parser.AggregateExpr:
 		switch texpr.Op {
@@ -57,6 +95,11 @@ func newResultSort(expr parser.Expr) resultSorter {
 			return aggregateResultSort{
 				sortingLabels: texpr.Grouping,
 				sortOrder:     sortOrderAsc,
+				groupBy:       !texpr.Without,
+			}
+		case parser.LIMITK, parser.LIMIT_RATIO:
+			return aggregateResultSort{
+				sortingLabels: texpr.Grouping,
 				groupBy:       !texpr.Without,
 			}
 		}
@@ -78,9 +121,47 @@ func valueCompare(order sortOrder, l, r float64) bool {
 	return l > r
 }
 
+// filterFloats filters out histogram samples from the vector in-place.
+func filterFloats(v promql.Vector) promql.Vector {
+	floats := v[:0]
+	for _, s := range v {
+		if s.H == nil {
+			floats = append(floats, s)
+		}
+	}
+	return floats
+}
+
 func (s sortFuncResultSort) comparer(samples *promql.Vector) func(i, j int) bool {
 	return func(i, j int) bool {
 		return valueCompare(s.sortOrder, (*samples)[i].F, (*samples)[j].F)
+	}
+}
+
+func (s sortByLabelFuncResult) comparer(samples *promql.Vector) func(i, j int) bool {
+	return func(i, j int) bool {
+		iLb := labels.NewBuilder((*samples)[i].Metric)
+		jLb := labels.NewBuilder((*samples)[j].Metric)
+
+		for _, label := range s.sortingLabels {
+			lv1 := iLb.Get(label)
+			lv2 := jLb.Get(label)
+
+			if lv1 == lv2 {
+				continue
+			}
+			if natsort.Compare(lv1, lv2) {
+				return s.sortOrder == sortOrderAsc
+			} else {
+				return s.sortOrder == sortOrderDesc
+			}
+		}
+		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+		if lblsCmp := labels.Compare(iLb.Labels(), jLb.Labels()); lblsCmp < 0 {
+			return s.sortOrder == sortOrderAsc
+		} else {
+			return s.sortOrder == sortOrderDesc
+		}
 	}
 }
 

@@ -5,9 +5,11 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
@@ -21,7 +23,7 @@ func TestMarshall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	{
 		req := cortexpb.WriteRequest{}
-		for i := 0; i < numSeries; i++ {
+		for i := range numSeries {
 			req.Timeseries = append(req.Timeseries, cortexpb.PreallocTimeseries{
 				TimeSeries: &cortexpb.TimeSeries{
 					Labels: []cortexpb.LabelAdapter{
@@ -114,10 +116,16 @@ func createTestIngesterClient(maxInflightPushRequests int64, currentInflightRequ
 
 type mockIngester struct {
 	IngesterClient
+	mock.Mock
 }
 
 func (m *mockIngester) Push(_ context.Context, _ *cortexpb.WriteRequest, _ ...grpc.CallOption) (*cortexpb.WriteResponse, error) {
 	return &cortexpb.WriteResponse{}, nil
+}
+
+func (m *mockIngester) PushStream(ctx context.Context, opts ...grpc.CallOption) (Ingester_PushStreamClient, error) {
+	args := m.Called(ctx, opts)
+	return args.Get(0).(Ingester_PushStreamClient), nil
 }
 
 type mockClientConn struct {
@@ -130,4 +138,136 @@ func (m *mockClientConn) Invoke(_ context.Context, _ string, _ any, _ any, _ ...
 
 func (m *mockClientConn) Close() error {
 	return nil
+}
+
+func TestClosableHealthAndIngesterClient_Close_Basic(t *testing.T) {
+	client := &closableHealthAndIngesterClient{
+		conn:                 &mockClientConn{},
+		addr:                 "test-addr",
+		inflightPushRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"ingester"}),
+	}
+
+	err := client.Close()
+	assert.NoError(t, err)
+}
+
+func TestClosableHealthAndIngesterClient_Close_WithActiveStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	streamChan := make(chan *streamWriteJob, 1)
+
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	job := &streamWriteJob{
+		ctx:    jobCtx,
+		cancel: jobCancel,
+	}
+	streamChan <- job
+
+	client := &closableHealthAndIngesterClient{
+		conn:                 &mockClientConn{},
+		addr:                 "test-addr",
+		inflightPushRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"ingester"}),
+		streamCtx:            ctx,
+		streamCancel:         cancel,
+		streamPushChan:       streamChan,
+	}
+
+	err := client.Close()
+	assert.NoError(t, err)
+
+	// Verify stream channel is closed
+	_, ok := <-client.streamPushChan
+	assert.False(t, ok, "stream channel should be closed")
+
+	// Verify context is cancelled
+	select {
+	case <-client.streamCtx.Done():
+		// Success - context was cancelled
+	case <-time.After(100 * time.Millisecond):
+		t.Error("stream context was not cancelled")
+	}
+}
+
+func TestClosableHealthAndIngesterClient_Close_WithPendingJobs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	streamChan := make(chan *streamWriteJob, 2)
+
+	job1Cancelled := false
+	job2Cancelled := false
+
+	job1 := &streamWriteJob{
+		ctx: context.Background(),
+		cancel: func() {
+			job1Cancelled = true
+		},
+	}
+	job2 := &streamWriteJob{
+		ctx: context.Background(),
+		cancel: func() {
+			job2Cancelled = true
+		},
+	}
+	streamChan <- job1
+	streamChan <- job2
+
+	client := &closableHealthAndIngesterClient{
+		conn:                 &mockClientConn{},
+		addr:                 "test-addr",
+		inflightPushRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"ingester"}),
+		streamCtx:            ctx,
+		streamCancel:         cancel,
+		streamPushChan:       streamChan,
+	}
+
+	err := client.Close()
+	assert.NoError(t, err)
+
+	_, ok := <-client.streamPushChan
+	assert.False(t, ok, "stream channel should be closed")
+
+	select {
+	case <-client.streamCtx.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Error("stream context was not cancelled")
+	}
+
+	// Verify jobs were cancelled
+	assert.True(t, job1Cancelled, "job1 should have been cancelled")
+	assert.True(t, job2Cancelled, "job2 should have been cancelled")
+}
+
+type mockClientStream struct {
+	mock.Mock
+	grpc.ClientStream
+}
+
+func (m *mockClientStream) Send(msg *cortexpb.StreamWriteRequest) error {
+	args := m.Called(msg)
+	return args.Error(0)
+}
+
+func (m *mockClientStream) Recv() (*cortexpb.WriteResponse, error) {
+	return &cortexpb.WriteResponse{}, nil
+}
+
+func TestClosableHealthAndIngesterClient_ShouldNotPanicWhenClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	streamChan := make(chan *streamWriteJob)
+
+	mockIngester := &mockIngester{}
+	mockStream := &mockClientStream{}
+	mockIngester.On("PushStream", mock.Anything, mock.Anything).Return(mockStream, nil).Once()
+
+	client := &closableHealthAndIngesterClient{
+		IngesterClient:       mockIngester,
+		conn:                 &mockClientConn{},
+		addr:                 "test-addr",
+		inflightPushRequests: prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"ingester"}),
+		streamCtx:            ctx,
+		streamCancel:         cancel,
+		streamPushChan:       streamChan,
+	}
+	require.NoError(t, client.worker(context.Background()))
+	require.NoError(t, client.Close())
+
+	time.Sleep(100 * time.Millisecond)
 }

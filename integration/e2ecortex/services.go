@@ -42,9 +42,10 @@ func NewDistributorWithConfigFile(name string, store RingStore, address, configF
 
 	// Configure the ingesters ring backend
 	flags["-ring.store"] = string(store)
-	if store == RingStoreConsul {
+	switch store {
+	case RingStoreConsul:
 		flags["-consul.hostname"] = address
-	} else if store == RingStoreEtcd {
+	case RingStoreEtcd:
 		flags["-etcd.endpoints"] = address
 	}
 
@@ -82,10 +83,11 @@ func NewQuerierWithConfigFile(name string, store RingStore, address, configFile 
 		"-store-gateway.sharding-ring.store": string(store),
 	}
 
-	if store == RingStoreConsul {
+	switch store {
+	case RingStoreConsul:
 		ringBackendFlags["-consul.hostname"] = address
 		ringBackendFlags["-store-gateway.sharding-ring.consul.hostname"] = address
-	} else if store == RingStoreEtcd {
+	case RingStoreEtcd:
 		ringBackendFlags["-etcd.endpoints"] = address
 		ringBackendFlags["-store-gateway.sharding-ring.etcd.endpoints"] = address
 	}
@@ -130,10 +132,11 @@ func NewStoreGatewayWithConfigFile(name string, store RingStore, address string,
 		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
 	}
 
-	if store == RingStoreConsul {
+	switch store {
+	case RingStoreConsul:
 		flags["-consul.hostname"] = address
 		flags["-store-gateway.sharding-ring.consul.hostname"] = address
-	} else if store == RingStoreEtcd {
+	case RingStoreEtcd:
 		flags["-etcd.endpoints"] = address
 		flags["-store-gateway.sharding-ring.etcd.endpoints"] = address
 	}
@@ -173,9 +176,10 @@ func NewIngesterWithConfigFile(name string, store RingStore, address, configFile
 
 	// Configure the ingesters ring backend
 	flags["-ring.store"] = string(store)
-	if store == RingStoreConsul {
+	switch store {
+	case RingStoreConsul:
 		flags["-consul.hostname"] = address
-	} else if store == RingStoreEtcd {
+	case RingStoreEtcd:
 		flags["-etcd.endpoints"] = address
 	}
 
@@ -193,6 +197,41 @@ func NewIngesterWithConfigFile(name string, store RingStore, address, configFile
 			"-ingester.join-after":         "0s",
 			"-ingester.min-ready-duration": "0s",
 			"-ingester.num-tokens":         "512",
+		}, flags))...),
+		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
+		httpPort,
+		grpcPort,
+	)
+}
+
+func NewParquetConverter(name string, store RingStore, address string, flags map[string]string, image string) *CortexService {
+	return NewParquetConverterWithConfigFile(name, store, address, "", flags, image)
+}
+
+func NewParquetConverterWithConfigFile(name string, store RingStore, address, configFile string, flags map[string]string, image string) *CortexService {
+	if configFile != "" {
+		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
+	}
+
+	// Configure the ingesters ring backend
+	flags["-ring.store"] = string(store)
+	switch store {
+	case RingStoreConsul:
+		flags["-consul.hostname"] = address
+	case RingStoreEtcd:
+		flags["-etcd.endpoints"] = address
+	}
+
+	if image == "" {
+		image = GetDefaultImage()
+	}
+
+	return NewCortexService(
+		name,
+		image,
+		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
+			"-target":    "parquet-converter",
+			"-log.level": "warn",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -352,9 +391,9 @@ func NewAlertmanager(name string, flags map[string]string, image string) *Cortex
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                               "alertmanager",
-			"-log.level":                            "warn",
-			"-experimental.alertmanager.enable-api": "true",
+			"-target":                  "alertmanager",
+			"-log.level":               "warn",
+			"-alertmanager.enable-api": "true",
 		}, flags))...),
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
@@ -372,9 +411,9 @@ func NewAlertmanagerWithTLS(name string, flags map[string]string, image string) 
 		name,
 		image,
 		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
-			"-target":                               "alertmanager",
-			"-log.level":                            "warn",
-			"-experimental.alertmanager.enable-api": "true",
+			"-target":                  "alertmanager",
+			"-log.level":               "warn",
+			"-alertmanager.enable-api": "true",
 		}, flags))...),
 		e2e.NewTCPReadinessProbe(httpPort),
 		httpPort,

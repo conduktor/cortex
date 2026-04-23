@@ -5,6 +5,7 @@ package query
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,18 @@ import (
 	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
+
+var promqlFuncRequiresTwoSamples = map[string]struct{}{
+	"rate":                         {},
+	"irate":                        {},
+	"increase":                     {},
+	"delta":                        {},
+	"idelta":                       {},
+	"deriv":                        {},
+	"predict_linear":               {},
+	"holt_winters":                 {},
+	"double_exponential_smoothing": {},
+}
 
 type seriesStatsReporter func(seriesStats storepb.SeriesStatsCounter)
 
@@ -65,6 +78,8 @@ func NewQueryableCreator(
 	proxy storepb.StoreServer,
 	maxConcurrentSelects int,
 	selectTimeout time.Duration,
+	deduplicationFunc string,
+	seriesResponseBatchSize int,
 ) QueryableCreator {
 	gf := gate.NewGateFactory(extprom.WrapRegistererWithPrefix("concurrent_selects_", reg), maxConcurrentSelects, gate.Selects)
 
@@ -80,6 +95,7 @@ func NewQueryableCreator(
 	) storage.Queryable {
 		return &queryable{
 			logger:              logger,
+			deduplicationFunc:   deduplicationFunc,
 			replicaLabels:       replicaLabels,
 			storeDebugMatchers:  storeDebugMatchers,
 			proxy:               proxy,
@@ -90,38 +106,42 @@ func NewQueryableCreator(
 			gateProviderFn: func() gate.Gate {
 				return gf.New()
 			},
-			maxConcurrentSelects: maxConcurrentSelects,
-			selectTimeout:        selectTimeout,
-			shardInfo:            shardInfo,
-			seriesStatsReporter:  seriesStatsReporter,
+			maxConcurrentSelects:    maxConcurrentSelects,
+			selectTimeout:           selectTimeout,
+			shardInfo:               shardInfo,
+			seriesStatsReporter:     seriesStatsReporter,
+			seriesResponseBatchSize: seriesResponseBatchSize,
 		}
 	}
 }
 
 type queryable struct {
-	logger               log.Logger
-	replicaLabels        []string
-	storeDebugMatchers   [][]*labels.Matcher
-	proxy                storepb.StoreServer
-	deduplicate          bool
-	maxResolutionMillis  int64
-	partialResponse      bool
-	skipChunks           bool
-	gateProviderFn       func() gate.Gate
-	maxConcurrentSelects int
-	selectTimeout        time.Duration
-	shardInfo            *storepb.ShardInfo
-	seriesStatsReporter  seriesStatsReporter
+	logger                  log.Logger
+	deduplicationFunc       string
+	replicaLabels           []string
+	storeDebugMatchers      [][]*labels.Matcher
+	proxy                   storepb.StoreServer
+	deduplicate             bool
+	maxResolutionMillis     int64
+	partialResponse         bool
+	skipChunks              bool
+	gateProviderFn          func() gate.Gate
+	maxConcurrentSelects    int
+	selectTimeout           time.Duration
+	shardInfo               *storepb.ShardInfo
+	seriesStatsReporter     seriesStatsReporter
+	seriesResponseBatchSize int
 }
 
 // Querier returns a new storage querier against the underlying proxy store API.
 func (q *queryable) Querier(mint, maxt int64) (storage.Querier, error) {
-	return newQuerier(q.logger, mint, maxt, q.replicaLabels, q.storeDebugMatchers, q.proxy, q.deduplicate, q.maxResolutionMillis, q.partialResponse, q.skipChunks, q.gateProviderFn(), q.selectTimeout, q.shardInfo, q.seriesStatsReporter), nil
+	return newQuerier(q.logger, mint, maxt, q.deduplicationFunc, q.replicaLabels, q.storeDebugMatchers, q.proxy, q.deduplicate, q.maxResolutionMillis, q.partialResponse, q.skipChunks, q.gateProviderFn(), q.selectTimeout, q.shardInfo, q.seriesStatsReporter, q.seriesResponseBatchSize), nil
 }
 
 type querier struct {
 	logger                  log.Logger
 	mint, maxt              int64
+	deduplicationFunc       string
 	replicaLabels           []string
 	storeDebugMatchers      [][]*labels.Matcher
 	proxy                   storepb.StoreServer
@@ -133,6 +153,7 @@ type querier struct {
 	selectTimeout           time.Duration
 	shardInfo               *storepb.ShardInfo
 	seriesStatsReporter     seriesStatsReporter
+	seriesResponseBatchSize int
 }
 
 // newQuerier creates implementation of storage.Querier that fetches data from the proxy
@@ -141,6 +162,7 @@ func newQuerier(
 	logger log.Logger,
 	mint,
 	maxt int64,
+	deduplicationFunc string,
 	replicaLabels []string,
 	storeDebugMatchers [][]*labels.Matcher,
 	proxy storepb.StoreServer,
@@ -152,13 +174,10 @@ func newQuerier(
 	selectTimeout time.Duration,
 	shardInfo *storepb.ShardInfo,
 	seriesStatsReporter seriesStatsReporter,
+	seriesResponseBatchSize int,
 ) *querier {
 	if logger == nil {
 		logger = log.NewNopLogger()
-	}
-	rl := make(map[string]struct{})
-	for _, replicaLabel := range replicaLabels {
-		rl[replicaLabel] = struct{}{}
 	}
 
 	partialResponseStrategy := storepb.PartialResponseStrategy_ABORT
@@ -172,6 +191,7 @@ func newQuerier(
 
 		mint:                    mint,
 		maxt:                    maxt,
+		deduplicationFunc:       deduplicationFunc,
 		replicaLabels:           replicaLabels,
 		storeDebugMatchers:      storeDebugMatchers,
 		proxy:                   proxy,
@@ -181,6 +201,7 @@ func newQuerier(
 		skipChunks:              skipChunks,
 		shardInfo:               shardInfo,
 		seriesStatsReporter:     seriesStatsReporter,
+		seriesResponseBatchSize: seriesResponseBatchSize,
 	}
 }
 
@@ -210,6 +231,16 @@ func (s *seriesServer) Send(r *storepb.SeriesResponse) error {
 		return nil
 	}
 
+	if r.GetBatch() != nil {
+		batch := *r.GetBatch()
+		s.seriesSet = slices.Grow(s.seriesSet, len(batch.Series))
+		for _, series := range batch.Series {
+			s.seriesSet = append(s.seriesSet, *series)
+			s.seriesSetStats.Count(series)
+		}
+		return nil
+	}
+
 	// Unsupported field, skip.
 	return nil
 }
@@ -234,7 +265,7 @@ func aggrsFromFunc(f string) []storepb.Aggr {
 	if strings.HasPrefix(f, "sum_") {
 		return []storepb.Aggr{storepb.Aggr_SUM}
 	}
-	if f == "increase" || f == "rate" || f == "irate" || f == "resets" {
+	if f == "increase" || f == "rate" || f == "irate" || f == "resets" || f == "xincrease" || f == "xrate" {
 		return []storepb.Aggr{storepb.Aggr_COUNTER}
 	}
 	// In the default case, we retrieve count and sum to compute an average.
@@ -320,6 +351,7 @@ func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms .
 	}
 
 	aggrs := aggrsFromFunc(hints.Func)
+	maxResolutionMillis := maxResolutionFromSelectHints(q.maxResolutionMillis, hints.Range, hints.Func)
 
 	// TODO(bwplotka): Pass it using the SeriesRequest instead of relying on context.
 	ctx = context.WithValue(ctx, store.StoreMatcherKey, q.storeDebugMatchers)
@@ -333,11 +365,16 @@ func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms .
 		MaxTime:                 hints.End,
 		Limit:                   int64(hints.Limit),
 		Matchers:                sms,
-		MaxResolutionWindow:     q.maxResolutionMillis,
+		MaxResolutionWindow:     maxResolutionMillis,
 		Aggregates:              aggrs,
 		ShardInfo:               q.shardInfo,
 		PartialResponseStrategy: q.partialResponseStrategy,
 		SkipChunks:              q.skipChunks,
+		ResponseBatchSize:       int64(q.seriesResponseBatchSize),
+		QueryHints: &storepb.QueryHints{
+			ProjectionLabels:  hints.ProjectionLabels,
+			ProjectionInclude: hints.ProjectionInclude,
+		},
 	}
 	if q.isDedupEnabled() {
 		// Soft ask to sort without replica labels and push them at the end of labelset.
@@ -370,7 +407,7 @@ func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms .
 		warns,
 	)
 
-	return dedup.NewSeriesSet(set, hints.Func), resp.seriesSetStats, nil
+	return dedup.NewSeriesSet(set, hints.Func, q.deduplicationFunc), resp.seriesSetStats, nil
 }
 
 // LabelValues returns all potential values for a label name.
@@ -460,3 +497,13 @@ func (q *querier) LabelNames(ctx context.Context, hints *storage.LabelHints, mat
 }
 
 func (q *querier) Close() error { return nil }
+
+// maxResolutionFromSelectHints finds the max possible resolution by inferring from the promql query.
+func maxResolutionFromSelectHints(maxResolutionMillis int64, hintsRange int64, hintsFunc string) int64 {
+	if hintsRange > 0 {
+		if _, ok := promqlFuncRequiresTwoSamples[hintsFunc]; ok {
+			maxResolutionMillis = min(maxResolutionMillis, hintsRange/2)
+		}
+	}
+	return maxResolutionMillis
+}

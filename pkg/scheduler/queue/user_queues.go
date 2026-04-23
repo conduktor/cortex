@@ -169,7 +169,9 @@ func (q *queues) getOrAddQueue(userID string, maxQueriers int) userRequestQueue 
 		tmpQueue := q.createUserRequestQueue(userID)
 
 		// flush to new queue
-		for uq.queue.length() > 0 {
+		// If the new limit is lower than the current number of requests,
+		// the excess requests (newest ones) will be dropped to prevent deadlocks.
+		for (uq.queue.length() > 0) && (tmpQueue.length() < maxOutstanding) {
 			tmpQueue.enqueueRequest(uq.queue.dequeueRequest(0, false))
 		}
 
@@ -374,7 +376,7 @@ func shuffleQueriersForUser(userSeed int64, queriersToSelect int, allSortedQueri
 	scratchpad = append(scratchpad, allSortedQueriers...)
 
 	last := len(scratchpad) - 1
-	for i := 0; i < queriersToSelect; i++ {
+	for range queriersToSelect {
 		r := rnd.Intn(last + 1)
 		queriers[scratchpad[r]] = struct{}{}
 		scratchpad[r], scratchpad[last] = scratchpad[last], scratchpad[r]
@@ -393,13 +395,13 @@ func getPriorityList(queryPriority validation.QueryPriority, totalQuerierCount i
 		for _, priority := range queryPriority.Priorities {
 			reservedQuerierShardSize := util.DynamicShardSize(priority.ReservedQueriers, totalQuerierCount)
 
-			for i := 0; i < reservedQuerierShardSize; i++ {
+			for range reservedQuerierShardSize {
 				priorityList = append(priorityList, priority.Priority)
 			}
 		}
 	}
 
-	if len(priorityList) > totalQuerierCount {
+	if len(priorityList) >= totalQuerierCount {
 		return []int64{}
 	}
 

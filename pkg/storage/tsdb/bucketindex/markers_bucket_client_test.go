@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -16,10 +16,9 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
-	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
-
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	"github.com/cortexproject/cortex/pkg/storage/bucket/s3"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestGlobalMarker_ShouldUploadGlobalLocation(t *testing.T) {

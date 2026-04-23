@@ -15,6 +15,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/klauspost/compress/snappy"
+	"github.com/klauspost/compress/zstd"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
@@ -24,8 +26,11 @@ import (
 	"github.com/prometheus/prometheus/util/jsonutil"
 	"github.com/weaveworks/common/httpgrpc"
 
+	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/util/runutil"
+
+	"github.com/thanos-io/promql-engine/logicalplan"
 )
 
 var (
@@ -34,6 +39,24 @@ var (
 		SortMapKeys:            true,
 		ValidateJsonRawMessage: false,
 	}.Froze()
+)
+
+type CodecType string
+type Compression string
+
+const (
+	GzipCompression     Compression = "gzip"
+	ZstdCompression     Compression = "zstd"
+	SnappyCompression   Compression = "snappy"
+	NonCompression      Compression = ""
+	JsonCodecType       CodecType   = "json"
+	ProtobufCodecType   CodecType   = "protobuf"
+	ApplicationProtobuf string      = "application/x-protobuf"
+	ApplicationJson     string      = "application/json"
+
+	QueryResponseCortexMIMEType    = "application/" + QueryResponseCortexMIMESubType
+	QueryResponseCortexMIMESubType = "x-cortex-query+proto"
+	RulerUserAgent                 = "CortexRuler"
 )
 
 // Codec is used to encode/decode query range requests and responses so they can be passed down to middlewares.
@@ -48,7 +71,7 @@ type Codec interface {
 	// EncodeRequest encodes a Request into an http request.
 	EncodeRequest(context.Context, Request) (*http.Request, error)
 	// EncodeResponse encodes a Response into an http response.
-	EncodeResponse(context.Context, Response) (*http.Response, error)
+	EncodeResponse(context.Context, *http.Request, Response) (*http.Response, error)
 }
 
 // Merger is used by middlewares making multiple requests to merge back all responses into a single one.
@@ -74,6 +97,8 @@ type Request interface {
 	GetStep() int64
 	// GetQuery returns the query of the request.
 	GetQuery() string
+	// GetLogicalPlan returns the logical plan
+	GetLogicalPlan() logicalplan.Plan
 	// WithStartEnd clone the current request with different start and end timestamp.
 	WithStartEnd(startTime int64, endTime int64) Request
 	// WithQuery clone the current request with a different query.
@@ -92,12 +117,8 @@ func decodeSampleStream(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
 	for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
 		switch field {
 		case "metric":
-			metricString := iter.ReadAny().ToString()
 			lbls := labels.Labels{}
-			if err := json.UnmarshalFromString(metricString, &lbls); err != nil {
-				iter.ReportError("unmarshal SampleStream", err.Error())
-				return
-			}
+			chunk.DecodeLabels(unsafe.Pointer(&lbls), iter)
 			ss.Labels = cortexpb.FromLabelsToLabelAdapters(lbls)
 		case "values":
 			for iter.ReadArray() {
@@ -134,6 +155,7 @@ type PrometheusRequest struct {
 	Headers        http.Header
 	Stats          string
 	CachingOptions CachingOptions
+	LogicalPlan    logicalplan.Plan
 }
 
 func (m *PrometheusRequest) GetPath() string {
@@ -197,6 +219,13 @@ func (m *PrometheusRequest) GetStats() string {
 		return m.Stats
 	}
 	return ""
+}
+
+func (m *PrometheusRequest) GetLogicalPlan() logicalplan.Plan {
+	if m == nil {
+		return nil
+	}
+	return m.LogicalPlan
 }
 
 // WithStartEnd clones the current `PrometheusRequest` with a new `start` and `end` timestamp.
@@ -281,12 +310,8 @@ func encodeSampleStream(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	stream.WriteObjectStart()
 
 	stream.WriteObjectField(`metric`)
-	lbls, err := cortexpb.FromLabelAdaptersToLabels(ss.Labels).MarshalJSON()
-	if err != nil {
-		stream.Error = err
-		return
-	}
-	stream.SetBuffer(append(stream.Buffer(), lbls...))
+	metric := cortexpb.FromLabelAdaptersToLabels(ss.Labels)
+	chunk.EncodeLabels(unsafe.Pointer(&metric), stream)
 
 	if len(ss.Samples) > 0 {
 		stream.WriteMore()
@@ -322,12 +347,8 @@ func decodeSample(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
 	for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
 		switch field {
 		case "metric":
-			metricString := iter.ReadAny().ToString()
 			lbls := labels.Labels{}
-			if err := json.UnmarshalFromString(metricString, &lbls); err != nil {
-				iter.ReportError("unmarshal Sample", err.Error())
-				return
-			}
+			chunk.DecodeLabels(unsafe.Pointer(&lbls), iter)
 			ss.Labels = cortexpb.FromLabelsToLabelAdapters(lbls)
 		case "value":
 			ss.Sample = &cortexpb.Sample{}
@@ -347,12 +368,8 @@ func encodeSample(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	stream.WriteObjectStart()
 
 	stream.WriteObjectField(`metric`)
-	lbls, err := cortexpb.FromLabelAdaptersToLabels(ss.Labels).MarshalJSON()
-	if err != nil {
-		stream.Error = err
-		return
-	}
-	stream.SetBuffer(append(stream.Buffer(), lbls...))
+	metric := cortexpb.FromLabelAdaptersToLabels(ss.Labels)
+	chunk.EncodeLabels(unsafe.Pointer(&metric), stream)
 
 	if ss.Sample != nil {
 		stream.WriteMore()
@@ -428,7 +445,7 @@ type Buffer interface {
 	Bytes() []byte
 }
 
-func BodyBuffer(res *http.Response, logger log.Logger) ([]byte, error) {
+func BodyBytes(res *http.Response, logger log.Logger) ([]byte, error) {
 	var buf *bytes.Buffer
 
 	// Attempt to cast the response body to a Buffer and use it if possible.
@@ -446,8 +463,26 @@ func BodyBuffer(res *http.Response, logger log.Logger) ([]byte, error) {
 		}
 	}
 
+	// Handle decoding response if it was compressed
+	encoding := res.Header.Get("Content-Encoding")
+	return decode(buf, encoding, logger)
+}
+
+func BodyBytesFromHTTPGRPCResponse(res *httpgrpc.HTTPResponse, logger log.Logger) ([]byte, error) {
+	headers := http.Header{}
+	for _, h := range res.Headers {
+		headers[h.Key] = h.Values
+	}
+
+	// Handle decoding response if it was compressed
+	encoding := headers.Get("Content-Encoding")
+	buf := bytes.NewBuffer(res.Body)
+	return decode(buf, encoding, logger)
+}
+
+func decode(buf *bytes.Buffer, encoding string, logger log.Logger) ([]byte, error) {
 	// if the response is gzipped, lets unzip it here
-	if strings.EqualFold(res.Header.Get("Content-Encoding"), "gzip") {
+	if strings.EqualFold(encoding, "gzip") {
 		gReader, err := gzip.NewReader(buf)
 		if err != nil {
 			return nil, err
@@ -457,26 +492,24 @@ func BodyBuffer(res *http.Response, logger log.Logger) ([]byte, error) {
 		return io.ReadAll(gReader)
 	}
 
-	return buf.Bytes(), nil
-}
-
-func BodyBufferFromHTTPGRPCResponse(res *httpgrpc.HTTPResponse, logger log.Logger) ([]byte, error) {
-	// if the response is gzipped, lets unzip it here
-	headers := http.Header{}
-	for _, h := range res.Headers {
-		headers[h.Key] = h.Values
+	// if the response is snappy compressed, decode it here
+	if strings.EqualFold(encoding, "snappy") {
+		sReader := snappy.NewReader(buf)
+		return io.ReadAll(sReader)
 	}
-	if strings.EqualFold(headers.Get("Content-Encoding"), "gzip") {
-		gReader, err := gzip.NewReader(bytes.NewBuffer(res.Body))
+
+	// if the response is zstd compressed, decode it here
+	if strings.EqualFold(encoding, "zstd") {
+		zReader, err := zstd.NewReader(buf)
 		if err != nil {
 			return nil, err
 		}
-		defer runutil.CloseWithLogOnErr(logger, gReader, "close gzip reader")
+		defer runutil.CloseWithLogOnErr(logger, zReader.IOReadCloser(), "close zstd decoder")
 
-		return io.ReadAll(gReader)
+		return io.ReadAll(zReader)
 	}
 
-	return res.Body, nil
+	return buf.Bytes(), nil
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -494,7 +527,7 @@ func (s *PrometheusData) UnmarshalJSON(data []byte) error {
 	switch s.ResultType {
 	case model.ValVector.String():
 		var result struct {
-			Samples []*Sample `json:"result"`
+			Samples []Sample `json:"result"`
 		}
 		if err := json.Unmarshal(data, &result); err != nil {
 			return err
@@ -530,7 +563,7 @@ func (s *PrometheusData) MarshalJSON() ([]byte, error) {
 	case model.ValVector.String():
 		res := struct {
 			ResultType string                   `json:"resultType"`
-			Data       []*Sample                `json:"result"`
+			Data       []Sample                 `json:"result"`
 			Stats      *PrometheusResponseStats `json:"stats,omitempty"`
 		}{
 			ResultType: s.ResultType,
@@ -720,4 +753,59 @@ func marshalHistogramBucket(b HistogramBucket, stream *jsoniter.Stream) {
 	stream.WriteMore()
 	jsonutil.MarshalFloat(b.Count, stream)
 	stream.WriteArrayEnd()
+}
+
+func (s *PrometheusResponseStats) MarshalJSON() ([]byte, error) {
+	stats := struct {
+		Samples *PrometheusResponseSamplesStats `json:"samples"`
+	}{
+		Samples: s.Samples,
+	}
+	if s.Samples.TotalQueryableSamplesPerStep == nil {
+		s.Samples.TotalQueryableSamplesPerStep = []*PrometheusResponseQueryableSamplesStatsPerStep{}
+	}
+	return json.Marshal(stats)
+}
+
+func SetRequestHeaders(h http.Header, defaultCodecType CodecType, compression Compression) {
+	switch compression {
+	case GzipCompression:
+		h.Set("Accept-Encoding", string(GzipCompression))
+
+	case SnappyCompression:
+		h.Set("Accept-Encoding", string(SnappyCompression))
+
+	case ZstdCompression:
+		h.Set("Accept-Encoding", string(ZstdCompression))
+	}
+
+	if defaultCodecType == ProtobufCodecType {
+		h.Set("Accept", ApplicationProtobuf+", "+ApplicationJson)
+	} else {
+		h.Set("Accept", ApplicationJson)
+	}
+}
+
+func ParseResponseSizeHeader(header string) (int, bool, error) {
+	if header == "" {
+		return 0, false, nil
+	}
+	size, err := strconv.Atoi(header)
+	if err != nil {
+		return 0, false, err
+	}
+	return size, true, nil
+}
+
+func UnmarshalResponse(r *http.Response, buf []byte, resp *PrometheusResponse) error {
+	if r.Header == nil {
+		return json.Unmarshal(buf, resp)
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if contentType == ApplicationProtobuf || contentType == QueryResponseCortexMIMEType {
+		return proto.Unmarshal(buf, resp)
+	} else {
+		return json.Unmarshal(buf, resp)
+	}
 }

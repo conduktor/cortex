@@ -9,15 +9,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/query"
+	promstorage "github.com/thanos-io/promql-engine/storage/prometheus"
+	"github.com/thanos-io/promql-engine/warnings"
+
+	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/stats"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/warnings"
-	"github.com/thanos-io/promql-engine/query"
-	promstorage "github.com/thanos-io/promql-engine/storage/prometheus"
 )
 
 type Execution struct {
@@ -25,54 +27,46 @@ type Execution struct {
 	query           promql.Query
 	opts            *query.Options
 	queryRangeStart time.Time
-	vectorSelector  model.VectorOperator
-	model.OperatorTelemetry
+	queryRangeEnd   time.Time
+
+	vectorSelector model.VectorOperator
 }
 
-func NewExecution(query promql.Query, pool *model.VectorPool, queryRangeStart time.Time, opts *query.Options, _ storage.SelectHints) *Execution {
-	storage := newStorageFromQuery(query, opts)
+func NewExecution(query promql.Query, queryRangeStart, queryRangeEnd time.Time, engineLabels []labels.Labels, opts *query.Options, _ storage.SelectHints) model.VectorOperator {
+	storage := newStorageFromQuery(query, opts, engineLabels)
 	oper := &Execution{
 		storage:         storage,
 		query:           query,
 		opts:            opts,
 		queryRangeStart: queryRangeStart,
-		vectorSelector:  promstorage.NewVectorSelector(pool, storage, opts, 0, 0, false, 0, 1),
+		queryRangeEnd:   queryRangeEnd,
+		vectorSelector:  promstorage.NewVectorSelector(storage, opts, 0, 0, false, 0, 1),
 	}
 
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts.EnableAnalysis)
-
-	return oper
+	return telemetry.NewOperator(telemetry.NewTelemetry(oper, opts), oper)
 }
 
 func (e *Execution) Series(ctx context.Context) ([]labels.Labels, error) {
-	start := time.Now()
-	defer func() {
-		e.AddExecutionTimeTaken(time.Since(start))
-	}()
-
-	return e.vectorSelector.Series(ctx)
+	series, err := e.vectorSelector.Series(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return series, nil
 }
 
 func (e *Execution) String() string {
-	return fmt.Sprintf("[remoteExec] %s (%d, %d)", e.query, e.queryRangeStart.Unix(), e.opts.End.Unix())
+	return fmt.Sprintf("[remoteExec] %s (%d, %d)", e.query, e.queryRangeStart.Unix(), e.queryRangeEnd.Unix())
 }
 
-func (e *Execution) Next(ctx context.Context) ([]model.StepVector, error) {
-	start := time.Now()
-	defer func() { e.AddExecutionTimeTaken(time.Since(start)) }()
-
-	next, err := e.vectorSelector.Next(ctx)
-	if next == nil {
+func (e *Execution) Next(ctx context.Context, buf []model.StepVector) (int, error) {
+	n, err := e.vectorSelector.Next(ctx, buf)
+	if n == 0 {
 		// Closing the storage prematurely can lead to results from the query
 		// engine to be recycled. Because of this, we close the storage only
 		// when we are done with processing all samples returned by the query.
 		e.storage.Close()
 	}
-	return next, err
-}
-
-func (e *Execution) GetPool() *model.VectorPool {
-	return e.vectorSelector.GetPool()
+	return n, err
 }
 
 func (e *Execution) Explain() (next []model.VectorOperator) {
@@ -90,16 +84,18 @@ func (e *Execution) Samples() *stats.QuerySamples {
 type storageAdapter struct {
 	query promql.Query
 	opts  *query.Options
+	lbls  []labels.Labels
 
 	once   sync.Once
 	err    error
 	series []promstorage.SignedSeries
 }
 
-func newStorageFromQuery(query promql.Query, opts *query.Options) *storageAdapter {
+func newStorageFromQuery(query promql.Query, opts *query.Options, lbls []labels.Labels) *storageAdapter {
 	return &storageAdapter{
 		query: query,
 		opts:  opts,
+		lbls:  lbls,
 	}
 }
 
@@ -120,7 +116,7 @@ func (s *storageAdapter) executeQuery(ctx context.Context) {
 		warnings.AddToContext(w, ctx)
 	}
 	if result.Err != nil {
-		s.err = result.Err
+		s.err = errors.Wrapf(result.Err, "remote exec error [%s]", s.lbls)
 		return
 	}
 	switch val := result.Value.(type) {

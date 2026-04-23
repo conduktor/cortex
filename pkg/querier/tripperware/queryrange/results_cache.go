@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -26,12 +27,15 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier"
+	"github.com/cortexproject/cortex/pkg/querier/partialdata"
+	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -139,15 +143,21 @@ func (PrometheusResponseExtractor) ResponseWithoutStats(resp tripperware.Respons
 // CacheSplitter generates cache keys. This is a useful interface for downstream
 // consumers who wish to implement their own strategies.
 type CacheSplitter interface {
-	GenerateCacheKey(userID string, r tripperware.Request) string
+	GenerateCacheKey(ctx context.Context, userID string, r tripperware.Request) string
 }
 
-// constSplitter is a utility for using a constant split interval when determining cache keys
-type constSplitter time.Duration
+// splitter is a utility for using split interval when determining cache keys
+type splitter time.Duration
 
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
-func (t constSplitter) GenerateCacheKey(userID string, r tripperware.Request) string {
-	currentInterval := r.GetStart() / int64(time.Duration(t)/time.Millisecond)
+func (t splitter) GenerateCacheKey(ctx context.Context, userID string, r tripperware.Request) string {
+	stats := querier_stats.FromContext(ctx)
+	interval := stats.LoadSplitInterval()
+	if interval == 0 {
+		interval = time.Duration(t)
+	}
+
+	currentInterval := r.GetStart() / int64(interval/time.Millisecond)
 	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
 }
 
@@ -162,6 +172,7 @@ type resultsCache struct {
 	cache    cache.Cache
 	limits   tripperware.Limits
 	splitter CacheSplitter
+	now      func() time.Time
 
 	extractor                  Extractor
 	minCacheExtent             int64 // discard any cache extent smaller than this
@@ -205,6 +216,7 @@ func NewResultsCacheMiddleware(
 			extractor:                  extractor,
 			minCacheExtent:             (5 * time.Minute).Milliseconds(),
 			splitter:                   splitter,
+			now:                        time.Now,
 			shouldCache:                shouldCache,
 			cacheQueryableSamplesStats: cfg.CacheQueryableSamplesStats,
 		}
@@ -212,10 +224,10 @@ func NewResultsCacheMiddleware(
 }
 
 func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperware.Response, error) {
-	tenantIDs, err := tenant.TenantIDs(ctx)
+	tenantIDs, err := users.TenantIDs(ctx)
 	respWithStats := r.GetStats() != "" && s.cacheQueryableSamplesStats
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	// If cache_queryable_samples_stats is enabled we always need request the status upstream
@@ -230,8 +242,9 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 		return s.next.Do(ctx, r)
 	}
 
+	key := s.splitter.GenerateCacheKey(ctx, users.JoinTenantIDs(tenantIDs), r)
+
 	var (
-		key      = s.splitter.GenerateCacheKey(tenant.JoinTenantIDs(tenantIDs), r)
 		extents  []tripperware.Extent
 		response tripperware.Response
 	)
@@ -243,7 +256,8 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 		return s.next.Do(ctx, r)
 	}
 
-	cached, ok := s.get(ctx, key)
+	ttl := s.getTTLForExtents(tenantIDs, []tripperware.Extent{{Start: r.GetStart(), End: r.GetEnd()}})
+	cached, ok := s.get(ctx, key, ttl)
 	if ok {
 		response, extents, err = s.handleHit(ctx, r, cached, maxCacheTime)
 	} else {
@@ -270,7 +284,7 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 			}
 			extents[i].Response = any
 		}
-		s.put(ctx, key, extents)
+		s.put(ctx, key, extents, tenantIDs)
 	}
 
 	if err == nil && !respWithStats {
@@ -282,11 +296,9 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 // shouldCacheResponse says whether the response should be cached or not.
 func (s resultsCache) shouldCacheResponse(ctx context.Context, req tripperware.Request, r tripperware.Response, maxCacheTime int64) bool {
 	headerValues := getHeaderValuesWithName(r, cacheControlHeader)
-	for _, v := range headerValues {
-		if v == noStoreValue {
-			level.Debug(util_log.WithContext(ctx, s.logger)).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
-			return false
-		}
+	if slices.Contains(headerValues, noStoreValue) {
+		level.Debug(util_log.WithContext(ctx, s.logger)).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
+		return false
 	}
 
 	if !s.isAtModifierCachable(ctx, req, maxCacheTime) {
@@ -294,6 +306,9 @@ func (s resultsCache) shouldCacheResponse(ctx context.Context, req tripperware.R
 	}
 	if !s.isOffsetCachable(ctx, req) {
 		return false
+	}
+	if res, ok := r.(*tripperware.PrometheusResponse); ok {
+		return !slices.Contains(res.Warnings, partialdata.ErrPartialData.Error())
 	}
 
 	return true
@@ -313,7 +328,7 @@ func (s resultsCache) isAtModifierCachable(ctx context.Context, r tripperware.Re
 	if !strings.Contains(query, "@") {
 		return true
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := cortexparser.ParseExpr(query)
 	if err != nil {
 		// We are being pessimistic in such cases.
 		level.Warn(util_log.WithContext(ctx, s.logger)).Log("msg", "failed to parse query, considering @ modifier as not cacheable", "query", query, "err", err)
@@ -321,7 +336,12 @@ func (s resultsCache) isAtModifierCachable(ctx context.Context, r tripperware.Re
 	}
 
 	// This resolves the start() and end() used with the @ modifier.
-	expr = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()))
+	expr, err = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()), time.Duration(r.GetStep())*time.Millisecond)
+	if err != nil {
+		// We are being pessimistic in such cases.
+		level.Warn(util_log.WithContext(ctx, s.logger)).Log("msg", "failed to preprocess expr", "query", query, "err", err)
+		return false
+	}
 
 	end := r.GetEnd()
 	atModCachable := true
@@ -358,7 +378,7 @@ func (s resultsCache) isOffsetCachable(ctx context.Context, r tripperware.Reques
 	if !strings.Contains(query, "offset") {
 		return true
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := cortexparser.ParseExpr(query)
 	if err != nil {
 		level.Warn(util_log.WithContext(ctx, s.logger)).Log("msg", "failed to parse query, considering offset as not cacheable", "query", query, "err", err)
 		return false
@@ -434,7 +454,7 @@ func (s resultsCache) handleHit(ctx context.Context, r tripperware.Request, exte
 
 	level.Debug(util_log.WithContext(ctx, log)).Log("msg", "handle hit", "start", r.GetStart(), "spanID", jaegerSpanID(ctx))
 
-	requests, responses, err := s.partition(r, extents)
+	requests, responses, err := s.partition(ctx, r, extents)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -528,10 +548,10 @@ func merge(extents []tripperware.Extent, acc *accumulator) ([]tripperware.Extent
 		return nil, err
 	}
 	return append(extents, tripperware.Extent{
-		Start:    acc.Extent.Start,
-		End:      acc.Extent.End,
+		Start:    acc.Start,
+		End:      acc.End,
 		Response: any,
-		TraceId:  acc.Extent.TraceId,
+		TraceId:  acc.TraceId,
 	}), nil
 }
 
@@ -631,7 +651,7 @@ func convertFromTripperwarePrometheusResponse(resp tripperware.Response) tripper
 
 // partition calculates the required requests to satisfy req given the cached data.
 // extents must be in order by start time.
-func (s resultsCache) partition(req tripperware.Request, extents []tripperware.Extent) ([]tripperware.Request, []tripperware.Response, error) {
+func (s resultsCache) partition(ctx context.Context, req tripperware.Request, extents []tripperware.Extent) ([]tripperware.Request, []tripperware.Response, error) {
 	var requests []tripperware.Request
 	var cachedResponses []tripperware.Response
 	start := req.GetStart()
@@ -662,7 +682,14 @@ func (s resultsCache) partition(req tripperware.Request, extents []tripperware.E
 			return nil, nil, err
 		}
 		// extract the overlap from the cached extent.
-		cachedResponses = append(cachedResponses, s.extractor.Extract(start, req.GetEnd(), res))
+		promRes := s.extractor.Extract(start, req.GetEnd(), res).(*tripperware.PrometheusResponse)
+		cachedResponses = append(cachedResponses, promRes)
+
+		if queryStats := querier_stats.FromContext(ctx); queryStats != nil && promRes.Data.Stats != nil {
+			queryStats.AddScannedSamples(uint64(promRes.Data.Stats.Samples.TotalQueryableSamples))
+			queryStats.SetPeakSamples(max(queryStats.LoadPeakSamples(), uint64(promRes.Data.Stats.Samples.PeakSamples)))
+		}
+
 		start = extent.End
 	}
 
@@ -702,8 +729,8 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
-func (s resultsCache) get(ctx context.Context, key string) ([]tripperware.Extent, bool) {
-	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)})
+func (s resultsCache) get(ctx context.Context, key string, ttl time.Duration) ([]tripperware.Extent, bool) {
+	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)}, ttl)
 	if len(found) != 1 {
 		return nil, false
 	}
@@ -734,7 +761,50 @@ func (s resultsCache) get(ctx context.Context, key string) ([]tripperware.Extent
 	return resp.Extents, true
 }
 
-func (s resultsCache) put(ctx context.Context, key string, extents []tripperware.Extent) {
+// getTTLForExtents calculates the appropriate TTL for given extents based on whether
+// they overlap with the out-of-order time window.
+func (s resultsCache) getTTLForExtents(tenantIDs []string, extents []tripperware.Extent) time.Duration {
+	var resultsCacheTTL, outOfOrderCacheTTL time.Duration
+	if len(tenantIDs) > 0 {
+		// Use smallest non-zero TTL to respect the most restrictive tenant's cache policy
+		resultsCacheTTL = validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, s.limits.ResultsCacheTTL)
+		outOfOrderCacheTTL = validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, s.limits.OutOfOrderResultsCacheTTL)
+	}
+
+	if s.extentsOverlapOutOfOrderWindow(extents, tenantIDs) {
+		return outOfOrderCacheTTL
+	}
+	return resultsCacheTTL
+}
+
+// extentsOverlapOutOfOrderWindow checks if any extent overlaps with the out-of-order time window.
+// Returns true if any extent's end time is within the out-of-order window.
+func (s resultsCache) extentsOverlapOutOfOrderWindow(extents []tripperware.Extent, tenantIDs []string) bool {
+	if len(tenantIDs) == 0 {
+		return false
+	}
+
+	outOfOrderWindow := validation.MaxDurationPerTenant(tenantIDs, func(userID string) time.Duration {
+		return time.Duration(s.limits.OutOfOrderTimeWindow(userID))
+	})
+
+	if outOfOrderWindow == 0 {
+		return false
+	}
+
+	nowMs := s.now().UnixMilli()
+	outOfOrderCutoffMs := nowMs - int64(outOfOrderWindow/time.Millisecond)
+
+	for _, extent := range extents {
+		if extent.End >= outOfOrderCutoffMs {
+			return true
+		}
+	}
+
+	return false
+}
+func (s resultsCache) put(ctx context.Context, key string, extents []tripperware.Extent, tenantIDs []string) {
+	ttl := s.getTTLForExtents(tenantIDs, extents)
 	buf, err := proto.Marshal(&tripperware.CachedResponse{
 		Key:     key,
 		Extents: extents,
@@ -744,7 +814,7 @@ func (s resultsCache) put(ctx context.Context, key string, extents []tripperware
 		return
 	}
 
-	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf})
+	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf}, ttl)
 }
 
 func jaegerSpanID(ctx context.Context) string {
@@ -791,6 +861,7 @@ func extractStats(start, end int64, stats *tripperware.PrometheusResponseStats) 
 		if start <= s.TimestampMs && s.TimestampMs <= end {
 			result.Samples.TotalQueryableSamplesPerStep = append(result.Samples.TotalQueryableSamplesPerStep, s)
 			result.Samples.TotalQueryableSamples += s.Value
+			result.Samples.PeakSamples = max(result.Samples.PeakSamples, s.Value)
 		}
 	}
 	return result
@@ -817,7 +888,17 @@ func extractSampleStream(start, end int64, stream tripperware.SampleStream) (tri
 			result.Samples = append(result.Samples, sample)
 		}
 	}
-	if len(result.Samples) == 0 {
+	if stream.Histograms != nil {
+		for _, histogram := range stream.Histograms {
+			if start <= histogram.TimestampMs && histogram.TimestampMs <= end {
+				if result.Histograms == nil {
+					result.Histograms = make([]tripperware.SampleHistogramPair, 0, len(stream.Histograms))
+				}
+				result.Histograms = append(result.Histograms, histogram)
+			}
+		}
+	}
+	if len(result.Samples) == 0 && len(result.Histograms) == 0 {
 		return tripperware.SampleStream{}, false
 	}
 	return result, true

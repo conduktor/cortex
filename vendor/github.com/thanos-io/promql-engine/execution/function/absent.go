@@ -6,39 +6,32 @@ package function
 import (
 	"context"
 	"sync"
-	"time"
-
-	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type absentOperator struct {
-	model.OperatorTelemetry
-
 	once     sync.Once
 	funcExpr *logicalplan.FunctionCall
 	series   []labels.Labels
-	pool     *model.VectorPool
 	next     model.VectorOperator
 }
 
 func newAbsentOperator(
 	funcExpr *logicalplan.FunctionCall,
-	pool *model.VectorPool,
 	next model.VectorOperator,
 	opts *query.Options,
-) *absentOperator {
+) model.VectorOperator {
 	oper := &absentOperator{
 		funcExpr: funcExpr,
-		pool:     pool,
 		next:     next,
 	}
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts.EnableAnalysis)
-
-	return oper
+	return telemetry.NewOperator(telemetry.NewTelemetry(oper, opts), oper)
 }
 
 func (o *absentOperator) String() string {
@@ -50,9 +43,6 @@ func (o *absentOperator) Explain() (next []model.VectorOperator) {
 }
 
 func (o *absentOperator) Series(_ context.Context) ([]labels.Labels, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
 	o.loadSeries()
 	return o.series, nil
 }
@@ -60,9 +50,7 @@ func (o *absentOperator) Series(_ context.Context) ([]labels.Labels, error) {
 func (o *absentOperator) loadSeries() {
 	// we need to put the filtered labels back for absent to compute its series properly
 	o.once.Do(func() {
-		o.pool.SetStepSize(1)
-
-		// https://github.com/prometheus/prometheus/blob/main/promql/functions.go#L1385
+		// https://github.com/prometheus/prometheus/blob/df1b4da348a7c2f8c0b294ffa1f05db5f6641278/promql/functions.go#L1857
 		var lm []*labels.Matcher
 		switch n := o.funcExpr.Args[0].(type) {
 		case *logicalplan.VectorSelector:
@@ -76,55 +64,43 @@ func (o *absentOperator) loadSeries() {
 		}
 
 		has := make(map[string]bool)
-		lmap := make(map[string]string)
+		b := labels.NewBuilder(labels.EmptyLabels())
 		for _, l := range lm {
 			if l.Name == labels.MetricName {
 				continue
 			}
 			if l.Type == labels.MatchEqual && !has[l.Name] {
-				lmap[l.Name] = l.Value
+				b.Set(l.Name, l.Value)
 				has[l.Name] = true
 			} else {
-				delete(lmap, l.Name)
+				b.Del(l.Name)
 			}
 		}
-		o.series = []labels.Labels{labels.FromMap(lmap)}
+		o.series = []labels.Labels{b.Labels()}
 	})
 }
 
-func (o *absentOperator) GetPool() *model.VectorPool {
-	return o.pool
-}
-
-func (o *absentOperator) Next(ctx context.Context) ([]model.StepVector, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
+func (o *absentOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	default:
 	}
 
 	o.loadSeries()
 
-	vectors, err := o.next.Next(ctx)
+	n, err := o.next.Next(ctx, buf)
 	if err != nil {
-		return nil, err
-	}
-	if len(vectors) == 0 {
-		return nil, nil
+		return 0, err
 	}
 
-	result := o.GetPool().GetVectorBatch()
-	for i := range vectors {
-		sv := o.GetPool().GetStepVector(vectors[i].T)
-		if len(vectors[i].Samples) == 0 && len(vectors[i].Histograms) == 0 {
-			sv.AppendSample(o.GetPool(), 0, 1)
+	for i := range n {
+		vector := &buf[i]
+		isEmpty := len(vector.Samples) == 0 && len(vector.Histograms) == 0
+		vector.Reset(vector.T)
+		if isEmpty {
+			vector.AppendSample(0, 1)
 		}
-		result = append(result, sv)
-		o.next.GetPool().PutStepVector(vectors[i])
 	}
-	o.next.GetPool().PutVectors(vectors)
-	return result, nil
+	return n, nil
 }

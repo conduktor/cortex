@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
@@ -287,7 +288,7 @@ func TestPusherErrors(t *testing.T) {
 			writes := prometheus.NewCounter(prometheus.CounterOpts{})
 			failures := prometheus.NewCounter(prometheus.CounterOpts{})
 
-			pa := NewPusherAppendable(pusher, "user-1", ruleLimits{}, writes, failures)
+			pa := NewPusherAppendable(pusher, "user-1", &ruleLimits{}, writes, failures)
 
 			lbls, err := parser.ParseMetric("foo_bar")
 			require.NoError(t, err)
@@ -381,7 +382,7 @@ func TestMetricsQueryFuncErrors(t *testing.T) {
 				}
 				return promql.Vector{}, err
 			}
-			qf := MetricsQueryFunc(mockFunc, queries, failures)
+			qf := metricsQueryFunc(mockFunc, queries, failures)
 
 			_, err := qf(context.Background(), "test", time.Now())
 			require.Equal(t, tc.returnedError, err)
@@ -404,7 +405,7 @@ func TestRecordAndReportRuleQueryMetrics(t *testing.T) {
 		time.Sleep(1 * time.Second)
 		return promql.Vector{}, nil
 	}
-	qf := RecordAndReportRuleQueryMetrics(mockFunc, "userID", metrics, log.NewNopLogger())
+	qf := recordAndReportRuleQueryMetrics(mockFunc, "userID", metrics, log.NewNopLogger())
 	_, _ = qf(context.Background(), "test", time.Now())
 
 	require.GreaterOrEqual(t, testutil.ToFloat64(metrics.RulerQuerySeconds.WithLabelValues("userID")), float64(1))
@@ -412,4 +413,27 @@ func TestRecordAndReportRuleQueryMetrics(t *testing.T) {
 	require.Equal(t, testutil.ToFloat64(metrics.RulerQuerySamples.WithLabelValues("userID")), float64(2))
 	require.Equal(t, testutil.ToFloat64(metrics.RulerQueryChunkBytes.WithLabelValues("userID")), float64(10))
 	require.Equal(t, testutil.ToFloat64(metrics.RulerQueryDataBytes.WithLabelValues("userID")), float64(14))
+}
+func TestPusherAppender_Commit_WithDiscardOutOfOrder(t *testing.T) {
+	pusher := &fakePusher{response: &cortexpb.WriteResponse{}}
+	counter := prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})
+
+	appender := &PusherAppender{
+		ctx:          context.Background(),
+		pusher:       pusher,
+		userID:       "test-user",
+		totalWrites:  counter,
+		failedWrites: counter,
+		labels:       []labels.Labels{labels.FromStrings(labels.MetricName, "test_metric")},
+		samples:      []cortexpb.Sample{{TimestampMs: 1000, Value: 1.0}},
+	}
+
+	appender.SetOptions(&storage.AppendOptions{DiscardOutOfOrder: true})
+
+	err := appender.Commit()
+	require.NoError(t, err)
+
+	// Verify that DiscardOutOfOrder was set in the WriteRequest
+	require.NotNil(t, pusher.request, "WriteRequest should have been sent")
+	require.True(t, pusher.request.DiscardOutOfOrder, "DiscardOutOfOrder should be true in WriteRequest")
 }

@@ -3,11 +3,13 @@ package ha
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -19,7 +21,9 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
+	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
@@ -39,7 +43,7 @@ func checkReplicaTimestamp(t *testing.T, duration time.Duration, c *HATracker, u
 	// to match "received at" precision
 	expected = expected.Truncate(time.Millisecond)
 
-	test.Poll(t, duration, nil, func() interface{} {
+	test.Poll(t, duration, nil, func() any {
 		c.electedLock.RLock()
 		r := c.elected[key]
 		c.electedLock.RUnlock()
@@ -108,24 +112,175 @@ func TestHATrackerConfig_Validate(t *testing.T) {
 			}(),
 			expectedErr: nil,
 		},
-		"should failed with invalid kv store": {
+		"should pass with memberlist kv store": {
 			cfg: func() HATrackerConfig {
 				cfg := HATrackerConfig{}
 				flagext.DefaultValues(&cfg)
 				cfg.KVStore.Store = "memberlist"
 				return cfg
 			}(),
-			expectedErr: fmt.Errorf("invalid HATracker KV store type: %s", "memberlist"),
+			expectedErr: nil,
+		},
+		"should pass with multi kv store": {
+			cfg: func() HATrackerConfig {
+				cfg := HATrackerConfig{}
+				flagext.DefaultValues(&cfg)
+				cfg.KVStore.Store = "multi"
+				return cfg
+			}(),
+			expectedErr: nil,
 		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, testData.expectedErr, testData.cfg.Validate())
 		})
 	}
+}
+
+type dnsProviderMock struct {
+	resolved []string
+}
+
+func (p *dnsProviderMock) Resolve(ctx context.Context, addrs []string, flushOld bool) error {
+	p.resolved = addrs
+	return nil
+}
+
+func (p dnsProviderMock) Addresses() []string {
+	return p.resolved
+}
+
+// TestHATracker_CleanupDeletesArePropagated demonstrates that when the HA tracker's
+// background cleanup loop removes stale replicas, it correctly triggers a memberlist
+// KV.Delete which in turn generates a tombstone broadcast.
+func TestHATracker_CleanupDeletesArePropagatedWithMemberlist(t *testing.T) {
+	ctx := context.Background()
+	logger := log.NewNopLogger()
+	reg := prometheus.NewPedanticRegistry()
+
+	var cfg memberlist.KVConfig
+	flagext.DefaultValues(&cfg)
+	replicaDescCodec := GetReplicaDescCodec()
+	cfg.Codecs = []codec.Codec{replicaDescCodec}
+	cfg.RetransmitMult = 1
+
+	mkv := memberlist.NewKV(cfg, logger, &dnsProviderMock{}, reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, mkv))
+	defer services.StopAndAwaitTerminated(ctx, mkv) //nolint:errcheck
+
+	client, err := memberlist.NewClient(mkv, replicaDescCodec)
+	require.NoError(t, err)
+
+	trackerCfg := HATrackerConfig{
+		EnableHATracker: false,
+		KVStore: kv.Config{
+			Store: "memberlist",
+		},
+	}
+	tracker, err := NewHATracker(trackerCfg, nil, HATrackerStatusConfig{}, reg, "", logger)
+	require.NoError(t, err)
+
+	// Inject our test memberlist client into the tracker
+	tracker.cfg.EnableHATracker = true
+	tracker.client = client
+
+	userID := "user1"
+	cluster := "cluster1"
+	replica := "replica0"
+	key := userID + "/" + cluster
+
+	// Inject initial HA data (simulates receiving a sample)
+	now := time.Now()
+	err = tracker.CheckReplica(ctx, userID, cluster, replica, now)
+	require.NoError(t, err)
+
+	// Drain the broadcast queue to clear out the CAS notification from CheckReplica
+	mkv.GetBroadcasts(0, math.MaxInt32)
+
+	// To call c.client.Delete(ctx, key) in cleanupOldReplicas
+	futureDeadline := now.Add(time.Hour)
+
+	// This will see (ReceivedAt < deadline) and CAS the entry to set DeletedAt = time.Now()
+	tracker.cleanupOldReplicas(ctx, futureDeadline)
+	require.Equal(t, float64(1), testutil.ToFloat64(tracker.replicasMarkedForDeletion))
+	require.Equal(t, float64(0), testutil.ToFloat64(tracker.deletedReplicas))
+
+	// This will see (DeletedAt > 0) and (DeletedAt < deadline), calling c.client.Delete(ctx, key)
+	tracker.cleanupOldReplicas(ctx, futureDeadline)
+	require.Equal(t, float64(1), testutil.ToFloat64(tracker.deletedReplicas))
+	require.Equal(t, float64(0), testutil.ToFloat64(tracker.markingForDeletionsFailed))
+
+	// Verify Local Deletion
+	val, err := client.Get(ctx, key)
+	require.NoError(t, err)
+	require.Nil(t, val, "HA Tracker cleanup should have deleted the key locally")
+
+	// Verify Broadcast Generation
+	broadcasts := mkv.GetBroadcasts(0, math.MaxInt32)
+	require.NotEmpty(t, broadcasts, "Cleanup Delete should generate a broadcast for tombstone propagation")
+}
+
+// TestWatchPrefixNilPanicWithMemberlist reproduces the panic at ha_tracker.go:437:
+// With memberlist, WatchPrefix delivers a nil value when a key is deleted
+// (memberlist KV.get() returns nil for deleted/tombstone keys).
+func TestWatchPrefixNilPanicWithMemberlist(t *testing.T) {
+	ctx := t.Context()
+	logger := log.NewNopLogger()
+	reg := prometheus.NewRegistry()
+
+	var kvCfg memberlist.KVConfig
+	flagext.DefaultValues(&kvCfg)
+	replicaDescCodec := GetReplicaDescCodec()
+	kvCfg.Codecs = []codec.Codec{replicaDescCodec}
+
+	mkv := memberlist.NewKV(kvCfg, logger, &dnsProviderMock{}, reg)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, mkv))
+	defer services.StopAndAwaitTerminated(ctx, mkv) //nolint:errcheck
+
+	client, err := memberlist.NewClient(mkv, replicaDescCodec)
+	require.NoError(t, err)
+
+	trackerCfg := HATrackerConfig{
+		EnableHATracker:        false, // to inject our client before starting the tracker
+		UpdateTimeout:          time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        2 * time.Second,
+		KVStore:                kv.Config{Store: "memberlist"},
+	}
+
+	tracker, err := NewHATracker(trackerCfg, nil, HATrackerStatusConfig{}, reg, "test", logger)
+	require.NoError(t, err)
+	tracker.cfg.EnableHATracker = true
+	tracker.client = client
+
+	// Start the tracker — this starts the WatchPrefix loop in loop().
+	require.NoError(t, services.StartAndAwaitRunning(ctx, tracker))
+	defer services.StopAndAwaitTerminated(ctx, tracker) //nolint:errcheck
+
+	userID := "user1"
+	cluster := "cluster1"
+	replica := "replica0"
+	key := userID + "/" + cluster
+
+	now := time.Now()
+	require.NoError(t, tracker.CheckReplica(ctx, userID, cluster, replica, now))
+
+	test.Poll(t, 3*time.Second, nil, func() any {
+		tracker.electedLock.RLock()
+		defer tracker.electedLock.RUnlock()
+		if _, ok := tracker.elected[key]; !ok {
+			return fmt.Errorf("waiting for key to appear in elected cache")
+		}
+		return nil
+	})
+
+	require.NoError(t, client.Delete(ctx, key))
+
+	time.Sleep(500 * time.Millisecond)
+	require.Equal(t, services.Running, tracker.State(), "HATracker should still be running after receiving nil value from memberlist WatchPrefix")
 }
 
 // Test that values are set in the HATracker after WatchPrefix has found it in the KVStore.
@@ -455,7 +610,6 @@ func TestCheckReplicaUpdateTimeoutJitter(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 			// Init HA tracker
@@ -573,7 +727,7 @@ func TestHAClustersLimit(t *testing.T) {
 
 func waitForClustersUpdate(t *testing.T, expected int, tr *HATracker, userID string) {
 	t.Helper()
-	test.Poll(t, 2*time.Second, expected, func() interface{} {
+	test.Poll(t, 2*time.Second, expected, func() any {
 		tr.electedLock.RLock()
 		defer tr.electedLock.RUnlock()
 
@@ -629,6 +783,7 @@ func TestHATracker_MetricsCleanup(t *testing.T) {
 		"cortex_ha_tracker_elected_replica_changes_total",
 		"cortex_ha_tracker_elected_replica_timestamp_seconds",
 		"cortex_ha_tracker_kv_store_cas_total",
+		"cortex_ha_tracker_user_replica_group_count",
 	}
 
 	tr.electedReplicaChanges.WithLabelValues("userA", "replicaGroup1").Add(5)
@@ -640,6 +795,7 @@ func TestHATracker_MetricsCleanup(t *testing.T) {
 	tr.kvCASCalls.WithLabelValues("userA", "replicaGroup1").Add(5)
 	tr.kvCASCalls.WithLabelValues("userA", "replicaGroup2").Add(8)
 	tr.kvCASCalls.WithLabelValues("userB", "replicaGroup").Add(10)
+	tr.userReplicaGroupCount.WithLabelValues("userA").Add(5)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 		# HELP cortex_ha_tracker_elected_replica_changes_total The total number of times the elected replica has changed for a user ID/cluster.
@@ -659,6 +815,10 @@ func TestHATracker_MetricsCleanup(t *testing.T) {
 		cortex_ha_tracker_kv_store_cas_total{cluster="replicaGroup",user="userB"} 10
 		cortex_ha_tracker_kv_store_cas_total{cluster="replicaGroup1",user="userA"} 5
 		cortex_ha_tracker_kv_store_cas_total{cluster="replicaGroup2",user="userA"} 8
+		
+		# HELP cortex_ha_tracker_user_replica_group_count Number of HA replica groups tracked for each user.
+		# TYPE cortex_ha_tracker_user_replica_group_count gauge
+		cortex_ha_tracker_user_replica_group_count{user="userA"} 5
 	`), metrics...))
 
 	tr.CleanupHATrackerMetricsForUser("userA")
@@ -754,9 +914,155 @@ func TestCheckReplicaCleanup(t *testing.T) {
 	))
 }
 
+func BenchmarkHATracker_syncKVStoreToLocalMap(b *testing.B) {
+	keyCounts := []int{100, 1000, 10000}
+
+	for _, count := range keyCounts {
+		b.Run(fmt.Sprintf("keys=%d", count), func(b *testing.B) {
+			ctx := context.Background()
+
+			codec := GetReplicaDescCodec()
+			kvStore, closer := consul.NewInMemoryClient(codec, log.NewNopLogger(), nil)
+			b.Cleanup(func() { assert.NoError(b, closer.Close()) })
+
+			mockKV := kv.PrefixClient(kvStore, "prefix")
+
+			for i := range count {
+				key := fmt.Sprintf("user-%d/cluster-%d", i%100, i)
+				desc := &ReplicaDesc{
+					Replica:    fmt.Sprintf("replica-%d", i),
+					ReceivedAt: timestamp.FromTime(time.Now()),
+				}
+				err := mockKV.CAS(ctx, key, func(_ any) (any, bool, error) {
+					return desc, true, nil
+				})
+				require.NoError(b, err)
+			}
+
+			cfg := HATrackerConfig{
+				EnableHATracker:   true,
+				EnableStartupSync: true,
+				KVStore:           kv.Config{Mock: mockKV},
+			}
+			tracker, _ := NewHATracker(cfg, trackerLimits{}, haTrackerStatusConfig, nil, "bench", log.NewNopLogger())
+
+			b.ReportAllocs()
+			for b.Loop() {
+				err := tracker.syncKVStoreToLocalMap(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestHATracker_CacheWarmupOnStart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := prometheus.NewPedanticRegistry()
+
+	codec := GetReplicaDescCodec()
+	kvStore, closer := consul.NewInMemoryClient(codec, log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	mockKV := kv.PrefixClient(kvStore, "prefix")
+
+	// CAS valid entry
+	user1 := "user1"
+	clusterUser1 := "clusterUser1"
+	key1 := fmt.Sprintf("%s/%s", user1, clusterUser1)
+	desc1 := &ReplicaDesc{
+		Replica:    "replica-0",
+		ReceivedAt: timestamp.FromTime(time.Now()),
+	}
+
+	err := mockKV.CAS(ctx, key1, func(_ any) (any, bool, error) {
+		return desc1, true, nil
+	})
+	require.NoError(t, err)
+
+	user2 := "user2"
+	clusterUser2 := "clusterUser2"
+	key2 := fmt.Sprintf("%s/%s", user2, clusterUser2)
+	desc2 := &ReplicaDesc{
+		Replica:    "replica-0",
+		ReceivedAt: timestamp.FromTime(time.Now()),
+	}
+	err = mockKV.CAS(ctx, key2, func(_ any) (any, bool, error) {
+		return desc2, true, nil
+	})
+	require.NoError(t, err)
+
+	// CAS deleted entry
+	clusterDeleted := "clusterDeleted"
+	keyDeleted := fmt.Sprintf("%s/%s", user1, clusterDeleted)
+	descDeleted := &ReplicaDesc{
+		Replica:    "replica-old",
+		ReceivedAt: timestamp.FromTime(time.Now()),
+		DeletedAt:  timestamp.FromTime(time.Now()), // Marked as deleted
+	}
+	err = mockKV.CAS(ctx, keyDeleted, func(_ any) (any, bool, error) {
+		return descDeleted, true, nil
+	})
+	require.NoError(t, err)
+
+	cfg := HATrackerConfig{
+		EnableHATracker:        true,
+		EnableStartupSync:      true,
+		KVStore:                kv.Config{Mock: mockKV}, // Use the seeded KV
+		UpdateTimeout:          time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        time.Second,
+	}
+
+	tracker, err := NewHATracker(cfg, trackerLimits{maxReplicaGroups: 100}, haTrackerStatusConfig, prometheus.WrapRegistererWithPrefix("cortex_", reg), "test-ha-tracker", log.NewNopLogger())
+	require.NoError(t, err)
+
+	// Start ha tracker
+	require.NoError(t, services.StartAndAwaitRunning(ctx, tracker))
+	defer services.StopAndAwaitTerminated(ctx, tracker) // nolint:errcheck
+
+	tracker.electedLock.Lock()
+	// Check local cache updated
+	desc1Cached, ok := tracker.elected[key1]
+	require.True(t, ok)
+	require.Equal(t, desc1.Replica, desc1Cached.Replica)
+
+	_, ok = tracker.elected[keyDeleted]
+	require.False(t, ok)
+
+	desc2Cached, ok := tracker.elected[key2]
+	require.True(t, ok)
+	require.Equal(t, desc2.Replica, desc2Cached.Replica)
+
+	// user1 should have 1 group (clusterUser1), ignoring clusterDeleted
+	require.NotNil(t, tracker.replicaGroups[user1])
+	require.Equal(t, 1, len(tracker.replicaGroups[user1]))
+	_, hasClusterUser1 := tracker.replicaGroups[user1][clusterUser1]
+	require.True(t, hasClusterUser1)
+
+	// user2 should have 1 group (clusterUser2), ignoring clusterDeleted
+	require.NotNil(t, tracker.replicaGroups[user2])
+	require.Equal(t, 1, len(tracker.replicaGroups[user2]))
+	_, hasClusterUser2 := tracker.replicaGroups[user2][clusterUser2]
+	require.True(t, hasClusterUser2)
+
+	tracker.electedLock.Unlock()
+
+	// Check metric updated
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_ha_tracker_user_replica_group_count Number of HA replica groups tracked for each user.
+		# TYPE cortex_ha_tracker_user_replica_group_count gauge
+		cortex_ha_tracker_user_replica_group_count{user="user1"} 1
+		cortex_ha_tracker_user_replica_group_count{user="user2"} 1
+	`), "cortex_ha_tracker_user_replica_group_count",
+	))
+}
+
 func checkUserReplicaGroups(t *testing.T, duration time.Duration, c *HATracker, user string, expectedReplicaGroups int) {
 	t.Helper()
-	test.Poll(t, duration, nil, func() interface{} {
+	test.Poll(t, duration, nil, func() any {
 		c.electedLock.RLock()
 		cl := len(c.replicaGroups[user])
 		c.electedLock.RUnlock()
@@ -772,7 +1078,7 @@ func checkUserReplicaGroups(t *testing.T, duration time.Duration, c *HATracker, 
 func checkReplicaDeletionState(t *testing.T, duration time.Duration, c *HATracker, user, replicaGroup string, expectedExistsInMemory, expectedExistsInKV, expectedMarkedForDeletion bool) {
 	key := fmt.Sprintf("%s/%s", user, replicaGroup)
 
-	test.Poll(t, duration, nil, func() interface{} {
+	test.Poll(t, duration, nil, func() any {
 		c.electedLock.RLock()
 		_, exists := c.elected[key]
 		c.electedLock.RUnlock()
@@ -794,4 +1100,281 @@ func checkReplicaDeletionState(t *testing.T, duration time.Duration, c *HATracke
 		markedForDeletion := val.(*ReplicaDesc).DeletedAt > 0
 		require.Equal(t, expectedMarkedForDeletion, markedForDeletion, "KV entry marked for deletion")
 	}
+}
+
+func TestReplicaDesc_Merge(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name           string
+		current        *ReplicaDesc
+		other          *ReplicaDesc
+		expectChange   bool
+		expectedResult *ReplicaDesc
+	}{
+		{
+			name: "merge with more recent replica",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica2",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  0,
+			},
+			expectChange: true,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica2",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "merge with older replica - no change",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  0,
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica2",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			expectChange: false,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "merge with deleted replica",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  timestamp.FromTime(now.Add(2 * time.Minute)),
+			},
+			expectChange: true,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(time.Minute)),
+				DeletedAt:  timestamp.FromTime(now.Add(2 * time.Minute)),
+			},
+		},
+		{
+			name: "undelete with more recent replica",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  timestamp.FromTime(now.Add(time.Minute)),
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(2 * time.Minute)),
+				DeletedAt:  0,
+			},
+			expectChange: true,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now.Add(2 * time.Minute)),
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "merge with nil other",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			other:        nil,
+			expectChange: false,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "merge deleted with more recent deleted",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  timestamp.FromTime(now.Add(time.Minute)),
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  timestamp.FromTime(now.Add(2 * time.Minute)),
+			},
+			expectChange: true,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  timestamp.FromTime(now.Add(2 * time.Minute)),
+			},
+		},
+		{
+			name: "same timestamp, different replica - choose lexicographically smaller",
+			current: &ReplicaDesc{
+				Replica:    "replica-b",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica-a",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			expectChange: true,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica-a",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "same timestamp, same replica - no change",
+			current: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			other: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+			expectChange: false,
+			expectedResult: &ReplicaDesc{
+				Replica:    "replica1",
+				ReceivedAt: timestamp.FromTime(now),
+				DeletedAt:  0,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var change memberlist.Mergeable
+			var err error
+
+			if tt.other != nil {
+				change, err = tt.current.Merge(tt.other, false)
+			} else {
+				change, err = tt.current.Merge(nil, false)
+			}
+
+			require.NoError(t, err)
+
+			if tt.expectChange {
+				require.NotNil(t, change, "expected a change to be returned")
+			} else {
+				require.Nil(t, change, "expected no change to be returned")
+			}
+
+			assert.Equal(t, tt.expectedResult.Replica, tt.current.Replica)
+			assert.Equal(t, tt.expectedResult.ReceivedAt, tt.current.ReceivedAt)
+			assert.Equal(t, tt.expectedResult.DeletedAt, tt.current.DeletedAt)
+		})
+	}
+}
+
+func TestReplicaDesc_Merge_Commutativity(t *testing.T) {
+	tests := []struct {
+		name  string
+		descA *ReplicaDesc
+		descB *ReplicaDesc
+	}{
+		{
+			name: "Same replica: New vs Older",
+			descA: &ReplicaDesc{
+				Replica:    "replica-A",
+				ReceivedAt: 200,
+				DeletedAt:  0,
+			},
+			descB: &ReplicaDesc{
+				Replica:    "replica-A",
+				ReceivedAt: 50,
+				DeletedAt:  100,
+			},
+		},
+		{
+			name: "Same Timestamps - Lexicographical Tie-break",
+			descA: &ReplicaDesc{
+				Replica:    "replica-A",
+				ReceivedAt: 100,
+				DeletedAt:  0,
+			},
+			descB: &ReplicaDesc{
+				Replica:    "replica-B",
+				ReceivedAt: 100,
+				DeletedAt:  0,
+			},
+		},
+		{
+			name: "Concurrent Deletions with Different Timestamps",
+			descA: &ReplicaDesc{
+				Replica:    "replica-A",
+				ReceivedAt: 50,
+				DeletedAt:  150,
+			},
+			descB: &ReplicaDesc{
+				Replica:    "replica-A",
+				ReceivedAt: 50,
+				DeletedAt:  120,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A merges B
+			nodeA := proto.Clone(tt.descA).(*ReplicaDesc)
+			incomingB := proto.Clone(tt.descB).(*ReplicaDesc)
+			_, _ = nodeA.Merge(incomingB, false)
+
+			// B merges A
+			nodeB := proto.Clone(tt.descB).(*ReplicaDesc)
+			incomingA := proto.Clone(tt.descA).(*ReplicaDesc)
+			_, _ = nodeB.Merge(incomingA, false)
+
+			// Check if both nodes converged to the exact same state
+			isSame := (nodeA.Replica == nodeB.Replica) &&
+				(nodeA.ReceivedAt == nodeB.ReceivedAt) &&
+				(nodeA.DeletedAt == nodeB.DeletedAt)
+
+			if !isSame {
+				t.Errorf("Commutativity violation in '%s'!\n"+
+					"Result of A.Merge(B): Replica=%s, ReceivedAt=%d, DeletedAt=%d\n"+
+					"Result of B.Merge(A): Replica=%s, ReceivedAt=%d, DeletedAt=%d",
+					tt.name,
+					nodeA.Replica, nodeA.ReceivedAt, nodeA.DeletedAt,
+					nodeB.Replica, nodeB.ReceivedAt, nodeB.DeletedAt)
+			}
+		})
+	}
+}
+
+func TestReplicaDesc_MergeContent(t *testing.T) {
+	desc := &ReplicaDesc{
+		Replica:    "replica1",
+		ReceivedAt: timestamp.FromTime(time.Now()),
+		DeletedAt:  0,
+	}
+
+	content := desc.MergeContent()
+	require.Equal(t, []string{"replica1"}, content)
+
+	emptyDesc := &ReplicaDesc{}
+	emptyContent := emptyDesc.MergeContent()
+	require.Nil(t, emptyContent)
 }

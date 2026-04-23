@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSyncerMetrics(t *testing.T) {
+func TestCompactorMetrics(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	cm := newCompactorMetricsWithLabels(reg, commonLabels, commonLabels)
 
@@ -18,42 +18,43 @@ func TestSyncerMetrics(t *testing.T) {
 	generateTestData(cm, 2222)
 
 	err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
-			# HELP blocks_meta_cortex_compactor_meta_base_syncs_total Total blocks metadata synchronization attempts by base Fetcher.
-			# TYPE blocks_meta_cortex_compactor_meta_base_syncs_total counter
-			blocks_meta_cortex_compactor_meta_base_syncs_total 11110
-			# HELP blocks_meta_cortex_compactor_meta_modified Number of blocks whose metadata changed
-			# TYPE blocks_meta_cortex_compactor_meta_modified gauge
-			blocks_meta_cortex_compactor_meta_modified{modified="replica-label-removed"} 0
-			# HELP blocks_meta_cortex_compactor_meta_sync_duration_seconds Duration of the blocks metadata synchronization in seconds.
-			# TYPE blocks_meta_cortex_compactor_meta_sync_duration_seconds histogram
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="0.01"} 0
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="1"} 2
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="10"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="100"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="300"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="600"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="1000"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_bucket{le="+Inf"} 3
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_sum 4.444
-			blocks_meta_cortex_compactor_meta_sync_duration_seconds_count 3
-			# HELP blocks_meta_cortex_compactor_meta_sync_failures_total Total blocks metadata synchronization failures.
-			# TYPE blocks_meta_cortex_compactor_meta_sync_failures_total counter
-			blocks_meta_cortex_compactor_meta_sync_failures_total 33330
-			# HELP blocks_meta_cortex_compactor_meta_synced Number of block metadata synced
-			# TYPE blocks_meta_cortex_compactor_meta_synced gauge
-			blocks_meta_cortex_compactor_meta_synced{state="corrupted-meta-json"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="duplicate"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="failed"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="label-excluded"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="loaded"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="marked-for-deletion"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="marked-for-no-compact"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="no-meta-json"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="time-excluded"} 0
-			blocks_meta_cortex_compactor_meta_synced{state="too-fresh"} 0
-			# HELP blocks_meta_cortex_compactor_meta_syncs_total Total blocks metadata synchronization attempts.
-			# TYPE blocks_meta_cortex_compactor_meta_syncs_total counter
-			blocks_meta_cortex_compactor_meta_syncs_total 22220
+			# HELP cortex_compactor_meta_base_syncs_total Total blocks metadata synchronization attempts by base Fetcher.
+			# TYPE cortex_compactor_meta_base_syncs_total counter
+			cortex_compactor_meta_base_syncs_total 11110
+			# HELP cortex_compactor_meta_modified Number of blocks whose metadata changed
+			# TYPE cortex_compactor_meta_modified gauge
+			cortex_compactor_meta_modified{modified="replica-label-removed"} 0
+			# HELP cortex_compactor_meta_sync_duration_seconds Duration of the blocks metadata synchronization in seconds.
+			# TYPE cortex_compactor_meta_sync_duration_seconds histogram
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="0.01"} 0
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="1"} 2
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="10"} 3
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="100"} 3
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="300"} 3
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="600"} 3
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="1000"} 3
+			cortex_compactor_meta_sync_duration_seconds_bucket{le="+Inf"} 3
+			cortex_compactor_meta_sync_duration_seconds_sum 4.444
+			cortex_compactor_meta_sync_duration_seconds_count 3
+			# HELP cortex_compactor_meta_sync_failures_total Total blocks metadata synchronization failures.
+			# TYPE cortex_compactor_meta_sync_failures_total counter
+			cortex_compactor_meta_sync_failures_total 33330
+			# HELP cortex_compactor_meta_synced Number of block metadata synced
+			# TYPE cortex_compactor_meta_synced gauge
+			cortex_compactor_meta_synced{state="corrupted-meta-json"} 0
+			cortex_compactor_meta_synced{state="duplicate"} 0
+			cortex_compactor_meta_synced{state="failed"} 0
+			cortex_compactor_meta_synced{state="label-excluded"} 0
+			cortex_compactor_meta_synced{state="loaded"} 0
+			cortex_compactor_meta_synced{state="marked-for-deletion"} 0
+			cortex_compactor_meta_synced{state="marked-for-no-compact"} 0
+			cortex_compactor_meta_synced{state="no-meta-json"} 0
+			cortex_compactor_meta_synced{state="parquet-migrated"} 0
+			cortex_compactor_meta_synced{state="time-excluded"} 0
+			cortex_compactor_meta_synced{state="too-fresh"} 0
+			# HELP cortex_compactor_meta_syncs_total Total blocks metadata synchronization attempts.
+			# TYPE cortex_compactor_meta_syncs_total counter
+			cortex_compactor_meta_syncs_total 22220
 			# HELP cortex_compact_group_compaction_planned_total Total number of compaction planned.
 			# TYPE cortex_compact_group_compaction_planned_total counter
 			cortex_compact_group_compaction_planned_total{user="aaa"} 211090
@@ -130,6 +131,21 @@ func TestSyncerMetrics(t *testing.T) {
 			cortex_compactor_compaction_error_total{type="unauthorized",user="aaa"} 477730
 			cortex_compactor_compaction_error_total{type="unauthorized",user="bbb"} 488840
 			cortex_compactor_compaction_error_total{type="unauthorized",user="ccc"} 499950
+			# HELP cortex_compactor_group_partition_count Number of partitions for each compaction group.
+			# TYPE cortex_compactor_group_partition_count gauge
+			cortex_compactor_group_partition_count{user="aaa"} 511060
+			cortex_compactor_group_partition_count{user="bbb"} 522170
+			cortex_compactor_group_partition_count{user="ccc"} 533280
+			# HELP cortex_compactor_group_compactions_not_planned_total Total number of group compaction not planned due to error.
+			# TYPE cortex_compactor_group_compactions_not_planned_total counter
+			cortex_compactor_group_compactions_not_planned_total{user="aaa"} 544390
+			cortex_compactor_group_compactions_not_planned_total{user="bbb"} 555500
+			cortex_compactor_group_compactions_not_planned_total{user="ccc"} 566610
+			# HELP cortex_compact_group_compaction_duration_seconds Duration of completed compactions in seconds
+			# TYPE cortex_compact_group_compaction_duration_seconds gauge
+			cortex_compact_group_compaction_duration_seconds{user="aaa"} 577720
+			cortex_compact_group_compaction_duration_seconds{user="bbb"} 588830
+			cortex_compact_group_compaction_duration_seconds{user="ccc"} 599940
 	`))
 	require.NoError(t, err)
 
@@ -183,4 +199,13 @@ func generateTestData(cm *compactorMetrics, base float64) {
 	cm.compactionErrorsCount.WithLabelValues("aaa", unauthorizedError).Add(43 * base)
 	cm.compactionErrorsCount.WithLabelValues("bbb", unauthorizedError).Add(44 * base)
 	cm.compactionErrorsCount.WithLabelValues("ccc", unauthorizedError).Add(45 * base)
+	cm.partitionCount.WithLabelValues("aaa").Add(46 * base)
+	cm.partitionCount.WithLabelValues("bbb").Add(47 * base)
+	cm.partitionCount.WithLabelValues("ccc").Add(48 * base)
+	cm.compactionsNotPlanned.WithLabelValues("aaa").Add(49 * base)
+	cm.compactionsNotPlanned.WithLabelValues("bbb").Add(50 * base)
+	cm.compactionsNotPlanned.WithLabelValues("ccc").Add(51 * base)
+	cm.compactionDuration.WithLabelValues("aaa").Add(52 * base)
+	cm.compactionDuration.WithLabelValues("bbb").Add(53 * base)
+	cm.compactionDuration.WithLabelValues("ccc").Add(54 * base)
 }

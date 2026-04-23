@@ -8,12 +8,12 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/compact"
 
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestMarkPending(t *testing.T) {

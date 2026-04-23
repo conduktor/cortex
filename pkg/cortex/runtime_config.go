@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 
@@ -15,21 +16,12 @@ import (
 )
 
 var (
-	errMultipleDocuments = errors.New("the provided runtime configuration contains multiple documents")
+	errMultipleDocuments    = errors.New("the provided runtime configuration contains multiple documents")
+	tenantLimitCheckTargets = []string{All, Distributor, Querier, Ruler}
 )
 
-// RuntimeConfigValues are values that can be reloaded from configuration file while Cortex is running.
-// Reloading is done by runtime_config.Manager, which also keeps the currently loaded config.
-// These values are then pushed to the components that are interested in them.
-type RuntimeConfigValues struct {
-	TenantLimits map[string]*validation.Limits `yaml:"overrides"`
-
-	Multi kv.MultiRuntimeConfig `yaml:"multi_kv_config"`
-
-	IngesterChunkStreaming *bool `yaml:"ingester_stream_chunks_when_using_blocks"`
-
-	IngesterLimits *ingester.InstanceLimits `yaml:"ingester_limits"`
-}
+// avoid circular imports
+type RuntimeConfigValues = runtimeconfig.RuntimeConfigValues
 
 // runtimeConfigTenantLimits provides per-tenant limit overrides based on a runtimeconfig.Manager
 // that reads limits from a configuration file on disk and periodically reloads them.
@@ -58,7 +50,11 @@ func (l *runtimeConfigTenantLimits) AllByUserID() map[string]*validation.Limits 
 	return nil
 }
 
-func loadRuntimeConfig(r io.Reader) (interface{}, error) {
+type runtimeConfigLoader struct {
+	cfg Config
+}
+
+func (l runtimeConfigLoader) load(r io.Reader) (any, error) {
 	var overrides = &RuntimeConfigValues{}
 
 	decoder := yaml.NewDecoder(r)
@@ -72,6 +68,24 @@ func loadRuntimeConfig(r io.Reader) (interface{}, error) {
 	// Ensure the provided YAML config is not composed of multiple documents,
 	if err := decoder.Decode(&RuntimeConfigValues{}); !errors.Is(err, io.EOF) {
 		return nil, errMultipleDocuments
+	}
+
+	targetStr := l.cfg.Target.String()
+	for _, target := range tenantLimitCheckTargets {
+		if strings.Contains(targetStr, target) {
+			// only check if target is `all`, `distributor`, "querier", and "ruler"
+			// refer to https://github.com/cortexproject/cortex/issues/6741#issuecomment-3067244929
+			if overrides != nil {
+				for userID, ul := range overrides.TenantLimits {
+					if err := ul.Validate(l.cfg.NameValidationScheme, l.cfg.Distributor.ShardByAllLabels, l.cfg.Ingester.ActiveSeriesMetricsEnabled); err != nil {
+						return nil, err
+					}
+					if err := ul.ValidateQueryLimits(userID, l.cfg.BlocksStorage.TSDB.CloseIdleTSDBTimeout); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
 
 	return overrides, nil
@@ -126,7 +140,7 @@ func runtimeConfigHandler(runtimeCfgManager *runtimeconfig.Manager, defaultLimit
 			return
 		}
 
-		var output interface{}
+		var output any
 		switch r.URL.Query().Get("mode") {
 		case "diff":
 			// Default runtime config is just empty struct, but to make diff work,

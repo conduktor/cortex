@@ -30,10 +30,10 @@ func TestClient_LoadAllRuleGroups(t *testing.T) {
 			{
 				Name:     "rule",
 				Interval: model.Duration(100 * time.Second),
-				Rules: []rulefmt.RuleNode{
+				Rules: []rulefmt.Rule{
 					{
-						Record: yaml.Node{Kind: yaml.ScalarNode, Value: "test_rule"},
-						Expr:   yaml.Node{Kind: yaml.ScalarNode, Value: "up"},
+						Record: "test_rule",
+						Expr:   "up",
 					},
 				},
 			},
@@ -66,7 +66,7 @@ func TestClient_LoadAllRuleGroups(t *testing.T) {
 
 	client, err := NewLocalRulesClient(Config{
 		Directory: dir,
-	}, promRules.FileLoader{})
+	}, promRules.FileLoader{}, model.UTF8Validation)
 	require.NoError(t, err)
 
 	ctx := context.Background()

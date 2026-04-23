@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
@@ -28,11 +31,12 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/engine"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	util_api "github.com/cortexproject/cortex/pkg/util/api"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
@@ -40,16 +44,20 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
 	supportedShardingStrategies = []string{util.ShardingStrategyDefault, util.ShardingStrategyShuffle}
 
+	supportedQueryResponseFormats = []string{queryResponseFormatJson, queryResponseFormatProtobuf}
+
 	// Validation errors.
-	errInvalidShardingStrategy   = errors.New("invalid sharding strategy")
-	errInvalidTenantShardSize    = errors.New("invalid tenant shard size, the value must be greater than 0")
-	errInvalidMaxConcurrentEvals = errors.New("invalid max concurrent evals, the value must be greater than 0")
+	errInvalidShardingStrategy    = errors.New("invalid sharding strategy")
+	errInvalidTenantShardSize     = errors.New("invalid tenant shard size, the value must be greater than 0")
+	errInvalidMaxConcurrentEvals  = errors.New("invalid max concurrent evals, the value must be greater than 0")
+	errInvalidQueryResponseFormat = errors.New("invalid query response format")
 )
 
 const (
@@ -77,12 +85,15 @@ const (
 	firingStateFilter   string = "firing"
 	pendingStateFilter  string = "pending"
 	inactiveStateFilter string = "inactive"
+	unknownStateFilter  string = "unknown"
 
 	unknownHealthFilter string = "unknown"
 	okHealthFilter      string = "ok"
 	errHealthFilter     string = "err"
 
-	livenessCheckTimeout = 100 * time.Millisecond
+	// query response formats
+	queryResponseFormatJson     = "json"
+	queryResponseFormatProtobuf = "protobuf"
 )
 
 type DisabledRuleGroupErr struct {
@@ -97,6 +108,9 @@ func (e *DisabledRuleGroupErr) Error() string {
 type Config struct {
 	// This is used for query to query frontend to evaluate rules
 	FrontendAddress string `yaml:"frontend_address"`
+	// Query response format of query frontend for evaluating rules
+	// It will only take effect FrontendAddress is configured.
+	QueryResponseFormat string `yaml:"query_response_format"`
 	// HTTP timeout duration when querying to query frontend to evaluate rules
 	FrontendTimeout time.Duration `yaml:"-"`
 	// Query frontend GRPC Client configuration.
@@ -161,12 +175,18 @@ type Config struct {
 	EnableQueryStats      bool `yaml:"query_stats_enabled"`
 	DisableRuleGroupLabel bool `yaml:"disable_rule_group_label"`
 
-	EnableHAEvaluation bool `yaml:"enable_ha_evaluation"`
+	EnableHAEvaluation   bool          `yaml:"enable_ha_evaluation"`
+	LivenessCheckTimeout time.Duration `yaml:"liveness_check_timeout"`
+
+	ThanosEngine engine.ThanosEngineConfig `yaml:"thanos_engine"`
+
+	// NameValidationScheme is the scheme for validating metric and label names (set from root config).
+	NameValidationScheme model.ValidationScheme `yaml:"-"`
 }
 
 // Validate config and returns error on failure
 func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
-	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
+	if !slices.Contains(supportedShardingStrategies, cfg.ShardingStrategy) {
 		return errInvalidShardingStrategy
 	}
 
@@ -185,6 +205,15 @@ func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 	if cfg.ConcurrentEvalsEnabled && cfg.MaxConcurrentEvals <= 0 {
 		return errInvalidMaxConcurrentEvals
 	}
+
+	if !slices.Contains(supportedQueryResponseFormats, cfg.QueryResponseFormat) {
+		return errInvalidQueryResponseFormat
+	}
+
+	if err := cfg.ThanosEngine.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -194,6 +223,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("ruler.frontendClient", "", f)
 	cfg.Ring.RegisterFlags(f)
 	cfg.Notifier.RegisterFlags(f)
+	cfg.ThanosEngine.RegisterFlagsWithPrefix("ruler.", f)
 
 	// Deprecated Flags that will be maintained to avoid user disruption
 
@@ -206,7 +236,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
 	flagext.DeprecatedFlag(f, "ruler.alertmanager-use-v2", "This flag is no longer functional. V1 API is deprecated and removed", util_log.Logger)
 
-	f.StringVar(&cfg.FrontendAddress, "ruler.frontend-address", "", "[Experimental] GRPC listen address of the Query Frontend, in host:port format. If set, Ruler queries to Query Frontends via gRPC. If not set, ruler queries to Ingesters directly.")
+	f.StringVar(&cfg.FrontendAddress, "ruler.frontend-address", "", "[Experimental] gRPC address of the Query Frontend (host:port). If set, the Ruler send queries to the Query Frontend to utilize splitting and caching, at the cost of additional network hops compared to direct querying to Ingesters and Store Gateway.")
+	f.StringVar(&cfg.QueryResponseFormat, "ruler.query-response-format", queryResponseFormatProtobuf, fmt.Sprintf("[Experimental] Query response format to get query results from Query Frontend when the rule evaluation. It will only take effect when `-ruler.frontend-address` is configured. Supported values: %s", strings.Join(supportedQueryResponseFormats, ",")))
 	cfg.ExternalURL.URL, _ = url.Parse("") // Must be non-nil
 	f.Var(&cfg.ExternalURL, "ruler.external.url", "URL of alerts return path.")
 	f.DurationVar(&cfg.EvaluationInterval, "ruler.evaluation-interval", 1*time.Minute, "How frequently to evaluate rules")
@@ -223,7 +254,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.ShardingStrategy, "ruler.sharding-strategy", util.ShardingStrategyDefault, fmt.Sprintf("The sharding strategy to use. Supported values are: %s.", strings.Join(supportedShardingStrategies, ", ")))
 	f.DurationVar(&cfg.FlushCheckPeriod, "ruler.flush-period", 1*time.Minute, "Period with which to attempt to flush rule groups.")
 	f.StringVar(&cfg.RulePath, "ruler.rule-path", "/rules", "file path to store temporary rule files for the prometheus rule managers")
-	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.EnableAPI, "ruler.enable-api", false, "Enable the ruler api")
+	f.BoolVar(&cfg.EnableAPI, "experimental.ruler.enable-api", false, "Deprecated: Use -ruler.enable-api instead.")
 	f.BoolVar(&cfg.APIDeduplicateRules, "experimental.ruler.api-deduplicate-rules", false, "EXPERIMENTAL: Remove duplicate rules in the prometheus rules and alerts API response. If there are duplicate rules the rule with the latest evaluation timestamp will be kept.")
 	f.DurationVar(&cfg.OutageTolerance, "ruler.for-outage-tolerance", time.Hour, `Max time to tolerate outage for restoring "for" state of alert.`)
 	f.DurationVar(&cfg.ForGracePeriod, "ruler.for-grace-period", 10*time.Minute, `Minimum duration between alert and restored "for" state. This is maintained only for alerts with configured "for" time greater than grace period.`)
@@ -238,7 +270,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.DisableRuleGroupLabel, "ruler.disable-rule-group-label", false, "Disable the rule_group label on exported metrics")
 
 	f.BoolVar(&cfg.EnableHAEvaluation, "ruler.enable-ha-evaluation", false, "Enable high availability")
-
+	f.DurationVar(&cfg.LivenessCheckTimeout, "ruler.liveness-check-timeout", 1*time.Second, "Timeout duration for non-primary rulers during liveness checks. If the check times out, the non-primary ruler will evaluate the rule group. Applicable when ruler.enable-ha-evaluation is true.")
 	cfg.RingCheckPeriod = 5 * time.Second
 }
 
@@ -315,10 +347,12 @@ type Ruler struct {
 	rulerGetRulesFailures      *prometheus.CounterVec
 	ruleGroupMetrics           *RuleGroupMetrics
 
-	allowedTenants *util.AllowedTenants
+	allowedTenants *users.AllowedTenants
 
 	registry prometheus.Registerer
 	logger   log.Logger
+
+	userIndexUpdater *users.UserIndexUpdater
 }
 
 // NewRuler creates a new ruler from a distributor and chunk store.
@@ -328,14 +362,15 @@ func NewRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer,
 
 func newRuler(cfg Config, manager MultiTenantManager, reg prometheus.Registerer, logger log.Logger, ruleStore rulestore.RuleStore, limits RulesLimits, clientPool ClientsPool) (*Ruler, error) {
 	ruler := &Ruler{
-		cfg:            cfg,
-		store:          ruleStore,
-		manager:        manager,
-		registry:       reg,
-		logger:         logger,
-		limits:         limits,
-		clientsPool:    clientPool,
-		allowedTenants: util.NewAllowedTenants(cfg.EnabledTenants, cfg.DisabledTenants),
+		cfg:              cfg,
+		userIndexUpdater: ruleStore.GetUserIndexUpdater(),
+		store:            ruleStore,
+		manager:          manager,
+		registry:         reg,
+		logger:           logger,
+		limits:           limits,
+		clientsPool:      clientPool,
+		allowedTenants:   users.NewAllowedTenants(cfg.EnabledTenants, cfg.DisabledTenants),
 
 		ringCheckErrors: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ruler_ring_check_errors_total",
@@ -570,6 +605,9 @@ func ownsRuleGroupOrDisable(g *rulespb.RuleGroupDesc, disabledRuleGroups validat
 }
 
 func (r *Ruler) LivenessCheck(_ context.Context, request *LivenessCheckRequest) (*LivenessCheckResponse, error) {
+	if r.lifecycler.ServiceContext() == nil {
+		return nil, errors.New("ruler is not yet ready")
+	}
 	if r.lifecycler.ServiceContext().Err() != nil || r.subservices.IsStopped() {
 		return nil, errors.New("ruler's context is canceled and might be stopping soon")
 	}
@@ -590,10 +628,10 @@ func (r *Ruler) nonPrimaryInstanceOwnsRuleGroup(g *rulespb.RuleGroupDesc, replic
 	responseChan := make(chan *LivenessCheckResponse, len(jobs))
 
 	ctx := user.InjectOrgID(context.Background(), userID)
-	ctx, cancel := context.WithTimeout(ctx, livenessCheckTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.LivenessCheckTimeout)
 	defer cancel()
 
-	err := concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job interface{}) error {
+	err := concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job any) error {
 		addr := job.(string)
 		rulerClient, err := r.GetClientFor(addr)
 		if err != nil {
@@ -665,13 +703,25 @@ func (r *Ruler) run(ctx context.Context) error {
 		ringTickerChan = ringTicker.C
 	}
 
-	r.syncRules(ctx, rulerSyncReasonInitial)
+	if r.userIndexUpdater != nil {
+		go r.userIndexUpdateLoop(ctx)
+	}
+
+	syncRuleErrMsg := func(syncRulesErr error) {
+		level.Error(r.logger).Log("msg", "failed to sync rules", "err", syncRulesErr)
+	}
+
+	initialSyncErr := r.syncRules(ctx, rulerSyncReasonInitial)
+	if initialSyncErr != nil {
+		syncRuleErrMsg(initialSyncErr)
+	}
 	for {
+		var syncRulesErr error
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-tick.C:
-			r.syncRules(ctx, rulerSyncReasonPeriodic)
+			syncRulesErr = r.syncRules(ctx, rulerSyncReasonPeriodic)
 		case <-ringTickerChan:
 			// We ignore the error because in case of error it will return an empty
 			// replication set which we use to compare with the previous state.
@@ -679,15 +729,84 @@ func (r *Ruler) run(ctx context.Context) error {
 
 			if ring.HasReplicationSetChanged(ringLastState, currRingState) {
 				ringLastState = currRingState
-				r.syncRules(ctx, rulerSyncReasonRingChange)
+				syncRulesErr = r.syncRules(ctx, rulerSyncReasonRingChange)
 			}
 		case err := <-r.subservicesWatcher.Chan():
 			return errors.Wrap(err, "ruler subservice failed")
 		}
+		if syncRulesErr != nil {
+			syncRuleErrMsg(syncRulesErr)
+		}
 	}
 }
 
-func (r *Ruler) syncRules(ctx context.Context, reason string) {
+func (r *Ruler) userIndexUpdateLoop(ctx context.Context) {
+	// Hardcode ID to check which ruler owns updating user index.
+	userID := users.UserIndexCompressedFilename
+	// Align with clean up interval.
+	ticker := time.NewTicker(util.DurationWithJitter(r.store.GetUserIndexUpdater().GetUpdateInterval(), 0.1))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			level.Error(r.logger).Log("msg", "context timeout, exit user index update loop", "err", ctx.Err())
+			return
+		case <-ticker.C:
+			owned, err := r.isUserOwned(userID)
+			if err != nil {
+				level.Error(r.logger).Log("msg", "failed to check if ruler owns updating user index", "err", err)
+				continue
+			}
+			if !owned {
+				continue
+			}
+			start := time.Now()
+			if err := r.userIndexUpdater.UpdateUserIndex(ctx); err != nil {
+				level.Error(r.logger).Log("msg", "failed to update user index", "err", err)
+				// Wait for next interval. Worst case, the user index scanner will fallback to list strategy.
+				continue
+			}
+			level.Info(r.logger).Log("msg", "successfully updated user index", "duration_ms", time.Since(start).Milliseconds())
+		}
+	}
+}
+
+func (r *Ruler) isUserOwned(userID string) (bool, error) {
+	if !r.allowedTenants.IsAllowed(userID) {
+		return false, nil
+	}
+
+	// If sharding is disabled, any ruler instance owns all users.
+	if !r.cfg.EnableSharding {
+		return true, nil
+	}
+
+	if r.cfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		shardSize := r.getShardSizeForUser(userID)
+		subRing := r.ring.ShuffleShard(userID, shardSize)
+
+		rs, err := subRing.GetAllHealthy(RingOp)
+		if err != nil {
+			r.ringCheckErrors.Inc()
+			level.Error(r.logger).Log("msg", "failed to get rulers from ring", "user", userID, "err", err)
+			return false, err
+		}
+
+		return rs.Includes(r.lifecycler.GetInstanceAddr()), nil
+	}
+
+	rulers, err := r.ring.Get(users.ShardByUser(userID), RingOp, nil, nil, nil)
+	if err != nil {
+		r.ringCheckErrors.Inc()
+		level.Error(r.logger).Log("msg", "failed to get rulers from ring", "user", userID, "err", err)
+		return false, err
+	}
+
+	return rulers.Includes(r.lifecycler.GetInstanceAddr()), nil
+}
+
+func (r *Ruler) syncRules(ctx context.Context, reason string) error {
 	level.Info(r.logger).Log("msg", "syncing rules", "reason", reason)
 	r.rulerSync.WithLabelValues(reason).Inc()
 	timer := prometheus.NewTimer(nil)
@@ -699,12 +818,12 @@ func (r *Ruler) syncRules(ctx context.Context, reason string) {
 
 	loadedConfigs, backupConfigs, err := r.loadRuleGroups(ctx)
 	if err != nil {
-		return
+		return err
 	}
 
 	if ctx.Err() != nil {
 		level.Info(r.logger).Log("msg", "context is canceled. not syncing rules")
-		return
+		return err
 	}
 	// This will also delete local group files for users that are no longer in 'configs' map.
 	r.manager.SyncRuleGroups(ctx, loadedConfigs)
@@ -712,6 +831,8 @@ func (r *Ruler) syncRules(ctx context.Context, reason string) {
 	if r.cfg.RulesBackupEnabled() {
 		r.manager.BackUpRuleGroups(ctx, backupConfigs)
 	}
+
+	return nil
 }
 
 func (r *Ruler) loadRuleGroups(ctx context.Context) (map[string]rulespb.RuleGroupList, map[string]rulespb.RuleGroupList, error) {
@@ -839,7 +960,7 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 	userRings := map[string]ring.ReadRing{}
 	for _, u := range users {
 		if shardSize := r.limits.RulerTenantShardSize(u); shardSize > 0 {
-			subRing := r.ring.ShuffleShard(u, shardSize)
+			subRing := r.ring.ShuffleShard(u, r.getShardSizeForUser(u))
 
 			// Include the user only if it belongs to this ruler shard.
 			if subRing.HasInstance(r.lifecycler.GetInstanceID()) {
@@ -869,13 +990,10 @@ func (r *Ruler) listRulesShuffleSharding(ctx context.Context) (map[string]rulesp
 	gLock := sync.Mutex{}
 	ruleGroupCounts := make(map[string]int, len(userRings))
 
-	concurrency := loadRulesConcurrency
-	if len(userRings) < concurrency {
-		concurrency = len(userRings)
-	}
+	concurrency := min(len(userRings), loadRulesConcurrency)
 
 	g, gctx := errgroup.WithContext(ctx)
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		g.Go(func() error {
 			for userID := range userCh {
 				groups, err := r.store.ListRuleGroupsForUserAndNamespace(gctx, userID, "")
@@ -988,20 +1106,28 @@ func (r *Ruler) filterBackupRuleGroups(userID string, ruleGroups []*rulespb.Rule
 
 // GetRules retrieves the running rules from this ruler and all running rulers in the ring if
 // sharding is enabled
-func (r *Ruler) GetRules(ctx context.Context, rulesRequest RulesRequest) ([]*GroupStateDesc, error) {
-	userID, err := tenant.TenantID(ctx)
+func (r *Ruler) GetRules(ctx context.Context, rulesRequest RulesRequest) (*RulesResponse, error) {
+	userID, err := users.TenantID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("no user id found in context")
 	}
 
 	if r.cfg.EnableSharding {
-		return r.getShardedRules(ctx, userID, rulesRequest)
+		resp, err := r.getShardedRules(ctx, userID, rulesRequest)
+		if resp == nil {
+			return &RulesResponse{
+				Groups:    make([]*GroupStateDesc, 0),
+				NextToken: "",
+			}, err
+		}
+		return resp, err
 	}
 
-	return r.getLocalRules(userID, rulesRequest, false)
+	response, err := r.getLocalRules(userID, rulesRequest, false)
+	return &response, err
 }
 
-func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeBackups bool) ([]*GroupStateDesc, error) {
+func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeBackups bool) (RulesResponse, error) {
 	groups := r.manager.GetRules(userID)
 
 	groupDescs := make([]*GroupStateDesc, 0, len(groups))
@@ -1023,7 +1149,7 @@ func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeB
 	health := rulesRequest.Health
 	matcherSets, err := parseMatchersParam(rulesRequest.Matchers)
 	if err != nil {
-		return nil, errors.Wrap(err, "error parsing matcher values")
+		return RulesResponse{}, errors.Wrap(err, "error parsing matcher values")
 	}
 
 	returnAlerts := ruleType == "" || ruleType == alertingRuleFilter
@@ -1033,7 +1159,7 @@ func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeB
 		// The mapped filename is url path escaped encoded to make handling `/` characters easier
 		decodedNamespace, err := url.PathUnescape(strings.TrimPrefix(group.File(), prefix))
 		if err != nil {
-			return nil, errors.Wrap(err, "unable to decode rule filename")
+			return RulesResponse{}, errors.Wrap(err, "unable to decode rule filename")
 		}
 		if len(fileSet) > 0 {
 			if _, OK := fileSet[decodedNamespace]; !OK {
@@ -1137,7 +1263,7 @@ func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeB
 					EvaluationDuration:  rule.GetEvaluationDuration(),
 				}
 			default:
-				return nil, errors.Errorf("failed to assert type of rule '%v'", rule.Name())
+				return RulesResponse{}, errors.Errorf("failed to assert type of rule '%v'", rule.Name())
 			}
 			groupDesc.ActiveRules = append(groupDesc.ActiveRules, ruleDesc)
 		}
@@ -1146,24 +1272,51 @@ func (r *Ruler) getLocalRules(userID string, rulesRequest RulesRequest, includeB
 		}
 	}
 
-	if !includeBackups {
-		return groupDescs, nil
+	combinedRuleStateDescs := groupDescs
+	if includeBackups {
+		backupGroups := r.manager.GetBackupRules(userID)
+		backupGroupDescs, err := r.ruleGroupListToGroupStateDesc(userID, backupGroups, groupListFilter{
+			ruleNameSet,
+			ruleGroupNameSet,
+			fileSet,
+			returnAlerts,
+			returnRecording,
+			matcherSets,
+		})
+		if err != nil {
+			return RulesResponse{}, err
+		}
+		combinedRuleStateDescs = append(combinedRuleStateDescs, backupGroupDescs...)
 	}
 
-	backupGroups := r.manager.GetBackupRules(userID)
-	backupGroupDescs, err := r.ruleGroupListToGroupStateDesc(userID, backupGroups, groupListFilter{
-		ruleNameSet,
-		ruleGroupNameSet,
-		fileSet,
-		returnAlerts,
-		returnRecording,
-		matcherSets,
-	})
-	if err != nil {
-		return nil, err
+	if rulesRequest.MaxRuleGroups <= 0 {
+		return RulesResponse{
+			Groups:    combinedRuleStateDescs,
+			NextToken: "",
+		}, nil
 	}
 
-	return append(groupDescs, backupGroupDescs...), nil
+	sort.Sort(PaginatedGroupStates(combinedRuleStateDescs))
+
+	resultingGroupDescs := make([]*GroupStateDesc, 0, len(combinedRuleStateDescs))
+	for _, group := range combinedRuleStateDescs {
+		groupID := GetRuleGroupNextToken(group.Group.Namespace, group.Group.Name)
+
+		// Only want groups whose groupID is greater than the token. This comparison works because
+		// we sort by that groupID
+		if len(rulesRequest.NextToken) > 0 && rulesRequest.NextToken >= groupID {
+			continue
+		}
+		if len(group.ActiveRules) > 0 {
+			resultingGroupDescs = append(resultingGroupDescs, group)
+		}
+	}
+
+	resultingGroupDescs, nextToken := generatePage(resultingGroupDescs, int(rulesRequest.MaxRuleGroups))
+	return RulesResponse{
+		Groups:    resultingGroupDescs,
+		NextToken: nextToken,
+	}, nil
 }
 
 type groupListFilter struct {
@@ -1204,6 +1357,7 @@ func (r *Ruler) ruleGroupListToGroupStateDesc(userID string, backupGroups rulesp
 				User:        userID,
 				Limit:       group.Limit,
 				QueryOffset: group.QueryOffset,
+				Labels:      group.Labels,
 			},
 			// We are keeping default value for EvaluationTimestamp and EvaluationDuration since the backup is not evaluating
 		}
@@ -1224,7 +1378,7 @@ func (r *Ruler) ruleGroupListToGroupStateDesc(userID string, backupGroups rulesp
 			}
 
 			var ruleDesc *RuleStateDesc
-			query, err := parser.ParseExpr(r.GetExpr())
+			query, err := cortexparser.ParseExpr(r.GetExpr())
 			if err != nil {
 				return nil, errors.Errorf("failed to parse rule query '%v'", r.GetExpr())
 			}
@@ -1272,11 +1426,18 @@ func (r *Ruler) ruleGroupListToGroupStateDesc(userID string, backupGroups rulesp
 	return groupDescs, nil
 }
 
-func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest RulesRequest) ([]*GroupStateDesc, error) {
+func (r *Ruler) getShardSizeForUser(userID string) int {
+	newShardSize := util.DynamicShardSize(r.limits.RulerTenantShardSize(userID), r.ring.InstancesCount())
+
+	// We want to guarantee that shard size will be at least replication factor
+	return max(newShardSize, r.cfg.Ring.ReplicationFactor)
+}
+
+func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest RulesRequest) (*RulesResponse, error) {
 	ring := ring.ReadRing(r.ring)
 
 	if shardSize := r.limits.RulerTenantShardSize(userID); shardSize > 0 && r.cfg.ShardingStrategy == util.ShardingStrategyShuffle {
-		ring = r.ring.ShuffleShard(userID, shardSize)
+		ring = r.ring.ShuffleShard(userID, r.getShardSizeForUser(userID))
 	}
 
 	rulers, failedZones, err := GetReplicationSetForListRule(ring, &r.cfg.Ring)
@@ -1291,7 +1452,7 @@ func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest
 
 	var (
 		mtx      sync.Mutex
-		merged   []*GroupStateDesc
+		merged   []*RulesResponse
 		errCount int
 	)
 
@@ -1303,7 +1464,7 @@ func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest
 	}
 	// Concurrently fetch rules from all rulers.
 	jobs := concurrency.CreateJobsFromStrings(rulers.GetAddresses())
-	err = concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job interface{}) error {
+	err = concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job any) error {
 		addr := job.(string)
 
 		rulerClient, err := r.clientsPool.GetClientFor(addr)
@@ -1318,8 +1479,12 @@ func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest
 			RuleGroupNames: rulesRequest.GetRuleGroupNames(),
 			Files:          rulesRequest.GetFiles(),
 			Type:           rulesRequest.GetType(),
-			ExcludeAlerts:  rulesRequest.GetExcludeAlerts(),
+			State:          rulesRequest.GetState(),
+			Health:         rulesRequest.GetHealth(),
 			Matchers:       rulesRequest.GetMatchers(),
+			ExcludeAlerts:  rulesRequest.GetExcludeAlerts(),
+			MaxRuleGroups:  rulesRequest.GetMaxRuleGroups(),
+			NextToken:      rulesRequest.GetNextToken(),
 		})
 
 		if err != nil {
@@ -1341,33 +1506,39 @@ func (r *Ruler) getShardedRules(ctx context.Context, userID string, rulesRequest
 		}
 
 		mtx.Lock()
-		merged = append(merged, newGrps.Groups...)
+		merged = append(merged, newGrps)
 		mtx.Unlock()
 
 		return nil
 	})
 
-	if err == nil && (r.cfg.RulesBackupEnabled() || r.cfg.APIDeduplicateRules) {
-		merged = mergeGroupStateDesc(merged)
+	if err == nil {
+		if r.cfg.RulesBackupEnabled() || r.cfg.APIDeduplicateRules {
+			return mergeGroupStateDesc(merged, rulesRequest.MaxRuleGroups, true), nil
+		}
+		return mergeGroupStateDesc(merged, rulesRequest.MaxRuleGroups, false), nil
 	}
 
-	return merged, err
+	return &RulesResponse{
+		Groups:    make([]*GroupStateDesc, 0),
+		NextToken: "",
+	}, err
 }
 
 // Rules implements the rules service
 func (r *Ruler) Rules(ctx context.Context, in *RulesRequest) (*RulesResponse, error) {
-	userID, err := tenant.TenantID(ctx)
+	userID, err := users.TenantID(ctx)
 
 	if err != nil {
 		return nil, fmt.Errorf("no user id found in context")
 	}
 
-	groupDescs, err := r.getLocalRules(userID, *in, r.cfg.RulesBackupEnabled())
+	response, err := r.getLocalRules(userID, *in, r.cfg.RulesBackupEnabled())
 	if err != nil {
 		return nil, err
 	}
 
-	return &RulesResponse{Groups: groupDescs}, nil
+	return &response, nil
 }
 
 // HasMaxRuleGroupsLimit check if RulerMaxRuleGroupsPerTenant limit is set for the userID.
@@ -1410,7 +1581,7 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {
 	logger := util_log.WithContext(req.Context(), r.logger)
 
-	userID, err := tenant.TenantID(req.Context())
+	userID, err := users.TenantID(req.Context())
 	if err != nil {
 		// When Cortex is running, it uses Auth Middleware for checking X-Scope-OrgID and injecting tenant into context.
 		// Auth Middleware sends http.StatusUnauthorized if X-Scope-OrgID is missing, so we do too here, for consistency.
@@ -1439,7 +1610,7 @@ func (r *Ruler) ListAllRules(w http.ResponseWriter, req *http.Request) {
 	}
 
 	done := make(chan struct{})
-	iter := make(chan interface{})
+	iter := make(chan any)
 
 	go func() {
 		util.StreamWriteYAMLV3Response(w, iter, logger)

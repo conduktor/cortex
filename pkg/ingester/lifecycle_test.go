@@ -43,6 +43,7 @@ func defaultIngesterTestConfig(t testing.TB) Config {
 	cfg.LifecyclerConfig.FinalSleep = 0
 	cfg.ActiveSeriesMetricsEnabled = true
 	cfg.LabelsStringInterningEnabled = true
+	cfg.MatchersCacheMaxItems = 1024
 	return cfg
 }
 
@@ -72,7 +73,7 @@ func TestIngesterRestart(t *testing.T) {
 		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ingester))
 	}
 
-	test.Poll(t, 100*time.Millisecond, 1, func() interface{} {
+	test.Poll(t, 100*time.Millisecond, 1, func() any {
 		return numTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost", RingKey)
 	})
 
@@ -87,7 +88,7 @@ func TestIngesterRestart(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	test.Poll(t, 100*time.Millisecond, 1, func() interface{} {
+	test.Poll(t, 100*time.Millisecond, 1, func() any {
 		return numTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost", RingKey)
 	})
 }
@@ -103,7 +104,7 @@ func TestIngester_ShutdownHandler(t *testing.T) {
 			require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingester))
 
 			// Make sure the ingester has been added to the ring.
-			test.Poll(t, 100*time.Millisecond, 1, func() interface{} {
+			test.Poll(t, 100*time.Millisecond, 1, func() any {
 				return numTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost", RingKey)
 			})
 
@@ -112,7 +113,7 @@ func TestIngester_ShutdownHandler(t *testing.T) {
 			require.Equal(t, http.StatusNoContent, recorder.Result().StatusCode)
 
 			// Make sure the ingester has been removed from the ring even when UnregisterFromRing is false.
-			test.Poll(t, 100*time.Millisecond, 0, func() interface{} {
+			test.Poll(t, 100*time.Millisecond, 0, func() any {
 				return numTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost", RingKey)
 			})
 		})

@@ -7,12 +7,13 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
 	"gopkg.in/yaml.v3"
 
+	"github.com/cortexproject/cortex/pkg/parser"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
@@ -53,7 +54,7 @@ func (v RuleFormatVersion) MarshalJSON() ([]byte, error) {
 }
 
 // MarshalYAML implements yaml.Marshaler.
-func (v RuleFormatVersion) MarshalYAML() (interface{}, error) {
+func (v RuleFormatVersion) MarshalYAML() (any, error) {
 	switch v {
 	case RuleFormatV1:
 		return yaml.Marshal("1")
@@ -82,7 +83,7 @@ func (v *RuleFormatVersion) UnmarshalJSON(data []byte) error {
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler.
-func (v *RuleFormatVersion) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (v *RuleFormatVersion) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return err
@@ -129,7 +130,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 }
 
 // MarshalYAML implements yaml.Marshaler.
-func (c Config) MarshalYAML() (interface{}, error) {
+func (c Config) MarshalYAML() (any, error) {
 	compat := &configCompat{
 		RulesFiles:         c.RulesConfig.Files,
 		RuleFormatVersion:  c.RulesConfig.FormatVersion,
@@ -158,7 +159,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler.
-func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error {
 	compat := configCompat{}
 	if err := unmarshal(&compat); err != nil {
 		return errors.WithStack(err)
@@ -229,13 +230,13 @@ func (c RulesConfig) Equal(o RulesConfig) bool {
 }
 
 // Parse parses and validates the content of the rule files in a RulesConfig
-// according to the passed rule format version.
-func (c RulesConfig) Parse() (map[string][]rules.Rule, error) {
+// according to the passed rule format version, using the given name validation scheme.
+func (c RulesConfig) Parse(nameValidationScheme model.ValidationScheme) (map[string][]rules.Rule, error) {
 	switch c.FormatVersion {
 	case RuleFormatV1:
 		return nil, fmt.Errorf("unsupported rule format version %v", c.FormatVersion)
 	case RuleFormatV2:
-		return c.parseV2()
+		return c.parseV2(nameValidationScheme)
 	default:
 		return nil, fmt.Errorf("unknown rule format version %v", c.FormatVersion)
 	}
@@ -243,24 +244,25 @@ func (c RulesConfig) Parse() (map[string][]rules.Rule, error) {
 
 // ParseFormatted returns the rulefmt map of a users rules configs. It allows
 // for rules to be mapped to disk and read by the prometheus rules manager.
-func (c RulesConfig) ParseFormatted() (map[string]rulefmt.RuleGroups, error) {
+// It uses the given name validation scheme for validation.
+func (c RulesConfig) ParseFormatted(nameValidationScheme model.ValidationScheme) (map[string]rulefmt.RuleGroups, error) {
 	switch c.FormatVersion {
 	case RuleFormatV1:
 		return nil, fmt.Errorf("unsupported rule format version %v", c.FormatVersion)
 	case RuleFormatV2:
-		return c.parseV2Formatted()
+		return c.parseV2Formatted(nameValidationScheme)
 	default:
 		return nil, fmt.Errorf("unknown rule format version %v", c.FormatVersion)
 	}
 }
 
-// parseV2 parses and validates the content of the rule files in a RulesConfig
+// parseV2Formatted parses and validates the content of the rule files in a RulesConfig
 // according to the Prometheus 2.x rule format.
-func (c RulesConfig) parseV2Formatted() (map[string]rulefmt.RuleGroups, error) {
+func (c RulesConfig) parseV2Formatted(nameValidationScheme model.ValidationScheme) (map[string]rulefmt.RuleGroups, error) {
 	ruleMap := map[string]rulefmt.RuleGroups{}
 
 	for fn, content := range c.Files {
-		rgs, errs := rulefmt.Parse([]byte(content))
+		rgs, errs := rulefmt.Parse([]byte(content), false, nameValidationScheme)
 		for _, err := range errs { // return just the first error, if any
 			return nil, err
 		}
@@ -283,11 +285,11 @@ func (c RulesConfig) parseV2Formatted() (map[string]rulefmt.RuleGroups, error) {
 // would otherwise have to ensure to convert the rulefmt.RuleGroup only exactly
 // once, not for every evaluation (or risk losing alert pending states). So
 // it's probably better to just return a set of rules.Rule here.
-func (c RulesConfig) parseV2() (map[string][]rules.Rule, error) {
+func (c RulesConfig) parseV2(nameValidationScheme model.ValidationScheme) (map[string][]rules.Rule, error) {
 	groups := map[string][]rules.Rule{}
 
 	for fn, content := range c.Files {
-		rgs, errs := rulefmt.Parse([]byte(content))
+		rgs, errs := rulefmt.Parse([]byte(content), false, nameValidationScheme)
 		if len(errs) > 0 {
 			return nil, fmt.Errorf("error parsing %s: %v", fn, errs[0])
 		}
@@ -295,28 +297,28 @@ func (c RulesConfig) parseV2() (map[string][]rules.Rule, error) {
 		for _, rg := range rgs.Groups {
 			rls := make([]rules.Rule, 0, len(rg.Rules))
 			for _, rl := range rg.Rules {
-				expr, err := parser.ParseExpr(rl.Expr.Value)
+				expr, err := parser.ParseExpr(rl.Expr)
 				if err != nil {
 					return nil, err
 				}
 
-				if rl.Alert.Value != "" {
+				if rl.Alert != "" {
 					rls = append(rls, rules.NewAlertingRule(
-						rl.Alert.Value,
+						rl.Alert,
 						expr,
 						time.Duration(rl.For),
 						time.Duration(rl.KeepFiringFor),
 						labels.FromMap(rl.Labels),
 						labels.FromMap(rl.Annotations),
-						nil,
+						labels.EmptyLabels(),
 						"",
 						true,
-						log.With(util_log.Logger, "alert", rl.Alert.Value),
+						util_log.GoKitLogToSlog(log.With(util_log.Logger, "alert", rl.Alert)),
 					))
 					continue
 				}
 				rls = append(rls, rules.NewRecordingRule(
-					rl.Record.Value,
+					rl.Record,
 					expr,
 					labels.FromMap(rl.Labels),
 				))

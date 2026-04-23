@@ -9,15 +9,14 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
-	"github.com/cortexproject/cortex/pkg/storage/tsdb"
-
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
+	"github.com/cortexproject/cortex/pkg/storage/parquet"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/runutil"
 )
@@ -33,8 +32,9 @@ var (
 
 // Updater is responsible to generate an update in-memory bucket index.
 type Updater struct {
-	bkt    objstore.InstrumentedBucket
-	logger log.Logger
+	bkt            objstore.InstrumentedBucket
+	logger         log.Logger
+	parquetEnabled bool
 }
 
 func NewUpdater(bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider, logger log.Logger) *Updater {
@@ -44,11 +44,18 @@ func NewUpdater(bkt objstore.Bucket, userID string, cfgProvider bucket.TenantCon
 	}
 }
 
+func (w *Updater) EnableParquet() *Updater {
+	w.parquetEnabled = true
+	return w
+}
+
 // UpdateIndex generates the bucket index and returns it, without storing it to the storage.
 // If the old index is not passed in input, then the bucket index will be generated from scratch.
 func (w *Updater) UpdateIndex(ctx context.Context, old *Index) (*Index, map[ulid.ULID]error, int64, error) {
-	var oldBlocks []*Block
-	var oldBlockDeletionMarks []*BlockDeletionMark
+	var (
+		oldBlocks             []*Block
+		oldBlockDeletionMarks []*BlockDeletionMark
+	)
 
 	// Read the old index, if provided.
 	if old != nil {
@@ -64,6 +71,11 @@ func (w *Updater) UpdateIndex(ctx context.Context, old *Index) (*Index, map[ulid
 	blocks, partials, err := w.updateBlocks(ctx, oldBlocks, deletedBlocks)
 	if err != nil {
 		return nil, nil, 0, err
+	}
+	if w.parquetEnabled {
+		if err := w.updateParquetBlocks(ctx, blocks); err != nil {
+			return nil, nil, 0, err
+		}
 	}
 
 	return &Index{
@@ -137,7 +149,7 @@ func (w *Updater) updateBlockIndexEntry(ctx context.Context, id ulid.ULID) (*Blo
 	metaFile := path.Join(id.String(), block.MetaFilename)
 
 	// Get the block's meta.json file.
-	r, err := w.bkt.ReaderWithExpectedErrs(tsdb.IsOneOfTheExpectedErrors(w.bkt.IsObjNotFoundErr, w.bkt.IsAccessDeniedErr)).Get(ctx, metaFile)
+	r, err := w.bkt.ReaderWithExpectedErrs(bucket.IsOneOfTheExpectedErrors(w.bkt.IsObjNotFoundErr, w.bkt.IsAccessDeniedErr)).Get(ctx, metaFile)
 	if w.bkt.IsObjNotFoundErr(err) {
 		return nil, ErrBlockMetaNotFound
 	}
@@ -178,6 +190,24 @@ func (w *Updater) updateBlockIndexEntry(ctx context.Context, id ulid.ULID) (*Blo
 	block.UploadedAt = attrs.LastModified.Unix()
 
 	return block, nil
+}
+
+func (w *Updater) updateParquetBlockIndexEntry(ctx context.Context, id ulid.ULID, block *Block) error {
+	marker, err := parquet.ReadConverterMark(ctx, id, w.bkt, w.logger)
+	if err != nil {
+		return errors.Wrapf(err, "read parquet converter marker file: %v", path.Join(id.String(), parquet.ConverterMarkerFileName))
+	}
+	// Could be not found or access denied.
+	// Just treat it as no parquet block available.
+	if marker == nil || marker.Version == 0 {
+		return nil
+	}
+
+	block.Parquet = &parquet.ConverterMarkMeta{
+		Version: marker.Version,
+		Shards:  marker.Shards,
+	}
+	return nil
 }
 
 func (w *Updater) updateBlockMarks(ctx context.Context, old []*BlockDeletionMark) ([]*BlockDeletionMark, map[ulid.ULID]struct{}, int64, error) {
@@ -248,4 +278,32 @@ func (w *Updater) updateBlockDeletionMarkIndexEntry(ctx context.Context, id ulid
 	}
 
 	return BlockDeletionMarkFromThanosMarker(&m), nil
+}
+
+func (w *Updater) updateParquetBlocks(ctx context.Context, blocks []*Block) error {
+	discoveredParquetBlocks := map[ulid.ULID]struct{}{}
+
+	// Find all parquet markers in the storage.
+	if err := w.bkt.Iter(ctx, parquet.ConverterMarkerPrefix+"/", func(name string) error {
+		if blockID, ok := IsBlockParquetConverterMarkFilename(path.Base(name)); ok {
+			discoveredParquetBlocks[blockID] = struct{}{}
+		}
+
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "list block parquet converter marks")
+	}
+
+	// Check if parquet mark has been uploaded or deleted for the block.
+	for _, m := range blocks {
+		if _, ok := discoveredParquetBlocks[m.ID]; ok {
+			if err := w.updateParquetBlockIndexEntry(ctx, m.ID, m); err != nil {
+				return err
+			}
+		} else if m.Parquet != nil {
+			// Converter marker removed. Reset parquet field.
+			m.Parquet = nil
+		}
+	}
+	return nil
 }

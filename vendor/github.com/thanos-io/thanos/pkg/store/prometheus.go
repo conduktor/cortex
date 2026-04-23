@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -35,6 +37,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
@@ -89,7 +92,7 @@ func NewPrometheusStore(
 		promVersion:                   promVersion,
 		timestamps:                    timestamps,
 		remoteReadAcceptableResponses: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES},
-		buffers: sync.Pool{New: func() interface{} {
+		buffers: sync.Pool{New: func() any {
 			b := make([]byte, 0, initialBufSize)
 			return &b
 		}},
@@ -109,31 +112,6 @@ func (p *PrometheusStore) labelCallsSupportMatchers() bool {
 	return parseErr == nil && version.GTE(baseVer)
 }
 
-// Info returns store information about the Prometheus instance.
-// NOTE(bwplotka): MaxTime & MinTime are not accurate nor adjusted dynamically.
-// This is fine for now, but might be needed in future.
-func (p *PrometheusStore) Info(_ context.Context, _ *storepb.InfoRequest) (*storepb.InfoResponse, error) {
-	lset := p.externalLabelsFn()
-	mint, maxt := p.timestamps()
-
-	res := &storepb.InfoResponse{
-		Labels:    labelpb.ZLabelsFromPromLabels(lset),
-		StoreType: p.component.ToProto(),
-		MinTime:   mint,
-		MaxTime:   maxt,
-	}
-
-	// Until we deprecate the single labels in the reply, we just duplicate
-	// them here for migration/compatibility purposes.
-	res.LabelSets = []labelpb.ZLabelSet{}
-	if len(res.Labels) > 0 {
-		res.LabelSets = append(res.LabelSets, labelpb.ZLabelSet{
-			Labels: res.Labels,
-		})
-	}
-	return res, nil
-}
-
 func (p *PrometheusStore) getBuffer() *[]byte {
 	b := p.buffers.Get()
 	return b.(*[]byte)
@@ -145,11 +123,13 @@ func (p *PrometheusStore) putBuffer(b *[]byte) {
 
 // Series returns all series for a requested time range and label matcher.
 func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_SeriesServer) error {
-	s := newFlushableServer(seriesSrv, sortingStrategyStore)
+	s := newFlushableServer(
+		newBatchableServer(seriesSrv, int(r.ResponseBatchSize)),
+		sortingStrategyStore)
 
 	extLset := p.externalLabelsFn()
 
-	match, matchers, err := matchesExternalLabels(r.Matchers, extLset)
+	match, matchers, err := matchesExternalLabels(r.Matchers, extLset, storecache.NoopMatchersCache)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -320,7 +300,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	seriesStats := &storepb.SeriesStatsCounter{}
 
 	// TODO(bwplotka): Put read limit as a flag.
-	stream := remote.NewChunkedReader(bodySizer, remote.DefaultChunkedReadLimit, *data)
+	stream := remote.NewChunkedReader(bodySizer, config.DefaultChunkedReadLimit, *data)
 	hasher := hashPool.Get().(hash.Hash64)
 	defer hashPool.Put(hasher)
 	for {
@@ -449,10 +429,7 @@ func (p *PrometheusStore) chunkSamples(series *prompb.TimeSeries, maxSamplesPerC
 	defer hashPool.Put(hasher)
 
 	for len(samples) > 0 {
-		chunkSize := len(samples)
-		if chunkSize > maxSamplesPerChunk {
-			chunkSize = maxSamplesPerChunk
-		}
+		chunkSize := min(len(samples), maxSamplesPerChunk)
 
 		enc, cb, err := p.encodeChunk(samples[:chunkSize])
 		if err != nil {
@@ -512,8 +489,13 @@ func (p *PrometheusStore) startPromRemoteRead(ctx context.Context, q *prompb.Que
 
 // matchesExternalLabels returns false if given matchers are not matching external labels.
 // If true, matchesExternalLabels also returns Prometheus matchers without those matching external labels.
-func matchesExternalLabels(ms []storepb.LabelMatcher, externalLabels labels.Labels) (bool, []*labels.Matcher, error) {
-	tms, err := storepb.MatchersToPromMatchers(ms...)
+func matchesExternalLabels(ms []storepb.LabelMatcher, externalLabels labels.Labels, cache storecache.MatchersCache) (bool, []*labels.Matcher, error) {
+	var (
+		tms []*labels.Matcher
+		err error
+	)
+
+	tms, err = storecache.MatchersToPromMatchersCached(cache, ms...)
 	if err != nil {
 		return false, nil, err
 	}
@@ -561,7 +543,7 @@ func (p *PrometheusStore) encodeChunk(ss []prompb.Sample) (storepb.Chunk_Encodin
 func (p *PrometheusStore) LabelNames(ctx context.Context, r *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
 	extLset := p.externalLabelsFn()
 
-	match, matchers, err := matchesExternalLabels(r.Matchers, extLset)
+	match, matchers, err := matchesExternalLabels(r.Matchers, extLset, storecache.NoopMatchersCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -616,15 +598,13 @@ func (p *PrometheusStore) LabelValues(ctx context.Context, r *storepb.LabelValue
 	if r.Label == "" {
 		return nil, status.Error(codes.InvalidArgument, "label name parameter cannot be empty")
 	}
-	for i := range r.WithoutReplicaLabels {
-		if r.Label == r.WithoutReplicaLabels[i] {
-			return &storepb.LabelValuesResponse{}, nil
-		}
+	if slices.Contains(r.WithoutReplicaLabels, r.Label) {
+		return &storepb.LabelValuesResponse{}, nil
 	}
 
 	extLset := p.externalLabelsFn()
 
-	match, matchers, err := matchesExternalLabels(r.Matchers, extLset)
+	match, matchers, err := matchesExternalLabels(r.Matchers, extLset, storecache.NoopMatchersCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

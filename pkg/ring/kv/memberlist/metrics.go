@@ -3,9 +3,9 @@ package memberlist
 import (
 	"time"
 
-	armonmetrics "github.com/armon/go-metrics"
-	armonprometheus "github.com/armon/go-metrics/prometheus"
 	"github.com/go-kit/log/level"
+	armonmetrics "github.com/hashicorp/go-metrics"
+	armonprometheus "github.com/hashicorp/go-metrics/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -130,6 +130,13 @@ func (m *KV) createAndRegisterMetrics() {
 		Name:      "kv_store_value_tombstones_removed_total",
 		Help:      "Total number of tombstones which have been removed from KV store values",
 	}, []string{"key"})
+
+	m.sweptTombstones = promauto.With(m.registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: m.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "kv_store_swept_tombstones_total",
+		Help:      "Total number of deleted keys (tombstones) removed from the local store.",
+	})
 
 	m.memberlistMembersCount = promauto.With(m.registerer).NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: m.cfg.MetricsNamespace,

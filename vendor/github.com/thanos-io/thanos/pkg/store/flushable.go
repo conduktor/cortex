@@ -4,8 +4,9 @@
 package store
 
 import (
+	"slices"
+
 	"github.com/prometheus/prometheus/model/labels"
-	"golang.org/x/exp/slices"
 
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -49,7 +50,13 @@ type passthroughServer struct {
 	storepb.Store_SeriesServer
 }
 
-func (p *passthroughServer) Flush() error { return nil }
+func (p *passthroughServer) Flush() error {
+	// If the underlying server is also flushable, flush it
+	if f, ok := p.Store_SeriesServer.(flushableServer); ok {
+		return f.Flush()
+	}
+	return nil
+}
 
 // resortingServer is a flushableServer that resorts all series by their labels.
 // This is required if replica labels are stored internally in a TSDB.
@@ -89,5 +96,11 @@ func (r *resortingServer) Flush() error {
 			return err
 		}
 	}
+
+	// If the underlying server is also flushable, flush it
+	if fs, ok := r.Store_SeriesServer.(flushableServer); ok {
+		return fs.Flush()
+	}
+
 	return nil
 }

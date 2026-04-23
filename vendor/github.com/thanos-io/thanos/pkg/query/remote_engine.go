@@ -5,6 +5,7 @@ package query
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
@@ -21,22 +23,50 @@ import (
 	"github.com/prometheus/prometheus/util/stats"
 
 	"github.com/thanos-io/promql-engine/api"
-
-	"github.com/opentracing/opentracing-go"
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/server/http/middleware"
-	"github.com/thanos-io/thanos/pkg/store/labelpb"
+	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	grpc_tracing "github.com/thanos-io/thanos/pkg/tracing/tracing_middleware"
 )
 
+type RemoteEndpointsCreator func(
+	replicaLabels []string,
+	partialResponse bool,
+) api.RemoteEndpoints
+
+func NewRemoteEndpointsCreator(
+	logger log.Logger,
+	getEndpoints func() []Client,
+	partitionLabels []string,
+	timeout time.Duration,
+	queryDistributedWithOverlappingInterval bool,
+	autoDownsample bool,
+) RemoteEndpointsCreator {
+	return func(
+		replicaLabels []string,
+		partialResponse bool,
+	) api.RemoteEndpoints {
+		return NewRemoteEndpoints(logger, getEndpoints, Opts{
+			AutoDownsample:                          autoDownsample,
+			PartialResponse:                         partialResponse,
+			ReplicaLabels:                           replicaLabels,
+			PartitionLabels:                         partitionLabels,
+			Timeout:                                 timeout,
+			QueryDistributedWithOverlappingInterval: queryDistributedWithOverlappingInterval,
+		})
+	}
+}
+
 // Opts are the options for a PromQL query.
 type Opts struct {
-	AutoDownsample        bool
-	ReplicaLabels         []string
-	Timeout               time.Duration
-	EnablePartialResponse bool
+	AutoDownsample                          bool
+	ReplicaLabels                           []string
+	PartitionLabels                         []string
+	Timeout                                 time.Duration
+	PartialResponse                         bool
+	QueryDistributedWithOverlappingInterval bool
 }
 
 // Client is a query client that executes PromQL queries.
@@ -87,15 +117,14 @@ func (r remoteEndpoints) Engines() []api.RemoteEngine {
 type remoteEngine struct {
 	opts   Opts
 	logger log.Logger
-
 	client Client
 
-	mintOnce      sync.Once
-	mint          int64
-	maxtOnce      sync.Once
-	maxt          int64
-	labelSetsOnce sync.Once
-	labelSets     []labels.Labels
+	initOnce sync.Once
+
+	mint               int64
+	maxt               int64
+	labelSets          []labels.Labels
+	partitionLabelSets []labels.Labels
 }
 
 func NewRemoteEngine(logger log.Logger, queryClient Client, opts Opts) *remoteEngine {
@@ -106,82 +135,109 @@ func NewRemoteEngine(logger log.Logger, queryClient Client, opts Opts) *remoteEn
 	}
 }
 
-// MinT returns the minimum timestamp that is safe to query in the remote engine.
-// In order to calculate it, we find the highest min time for each label set, and we return
-// the lowest of those values.
-// Calculating the MinT this way makes remote queries resilient to cases where one tsdb replica would delete
-// a block due to retention before other replicas did the same.
-// See https://github.com/thanos-io/promql-engine/issues/187.
-func (r *remoteEngine) MinT() int64 {
-	r.mintOnce.Do(func() {
+func (r *remoteEngine) init() {
+	r.initOnce.Do(func() {
+		replicaLabelSet := make(map[string]struct{})
+		for _, lbl := range r.opts.ReplicaLabels {
+			replicaLabelSet[lbl] = struct{}{}
+		}
+		partitionLabelsSet := make(map[string]struct{})
+		for _, lbl := range r.opts.PartitionLabels {
+			partitionLabelsSet[lbl] = struct{}{}
+		}
+
+		// strip out replica labels and scopes the remaining labels
+		// onto the partition labels if they are set.
+
+		// partitionLabelSets are used to compute how to push down, they are the minimum set of labels
+		// that form a partition of the remote engines.
+		// labelSets are all labelsets of the remote engine, they are used for fan-out pruning on labels
+		// that dont meaningfully contribute to the partitioning but are still useful.
 		var (
 			hashBuf               = make([]byte, 0, 128)
 			highestMintByLabelSet = make(map[uint64]int64)
+
+			labelSetsBuilder          labels.ScratchBuilder
+			partitionLabelSetsBuilder labels.ScratchBuilder
+
+			labelSets          = make([]labels.Labels, 0, len(r.client.tsdbInfos))
+			partitionLabelSets = make([]labels.Labels, 0, len(r.client.tsdbInfos))
 		)
-		for _, lset := range r.infosWithoutReplicaLabels() {
-			key, _ := labelpb.ZLabelsToPromLabels(lset.Labels.Labels).HashWithoutLabels(hashBuf)
-			lsetMinT, ok := highestMintByLabelSet[key]
-			if !ok {
-				highestMintByLabelSet[key] = lset.MinTime
-				continue
+		for _, info := range r.client.tsdbInfos {
+			labelSetsBuilder.Reset()
+			partitionLabelSetsBuilder.Reset()
+			for _, lbl := range info.Labels.Labels {
+				if _, ok := replicaLabelSet[lbl.Name]; ok {
+					continue
+				}
+				labelSetsBuilder.Add(lbl.Name, lbl.Value)
+				if _, ok := partitionLabelsSet[lbl.Name]; !ok && len(partitionLabelsSet) > 0 {
+					continue
+				}
+				partitionLabelSetsBuilder.Add(lbl.Name, lbl.Value)
 			}
 
-			if lset.MinTime > lsetMinT {
-				highestMintByLabelSet[key] = lset.MinTime
+			partitionLabelSet := partitionLabelSetsBuilder.Labels()
+			labelSet := labelSetsBuilder.Labels()
+			labelSets = append(labelSets, labelSet)
+			partitionLabelSets = append(partitionLabelSets, partitionLabelSet)
+
+			key, _ := partitionLabelSet.HashWithoutLabels(hashBuf)
+			lsetMinT, ok := highestMintByLabelSet[key]
+			if !ok {
+				highestMintByLabelSet[key] = info.MinTime
+				continue
+			}
+			// If we are querying with overlapping intervals, we want to find the first available timestamp
+			// otherwise we want to find the last available timestamp.
+			if r.opts.QueryDistributedWithOverlappingInterval && info.MinTime < lsetMinT {
+				highestMintByLabelSet[key] = info.MinTime
+			} else if !r.opts.QueryDistributedWithOverlappingInterval && info.MinTime > lsetMinT {
+				highestMintByLabelSet[key] = info.MinTime
 			}
 		}
 
-		var mint int64 = math.MaxInt64
+		// mint is the minimum timestamp that is safe to query in the remote engine.
+		// In order to calculate it, we find the highest min time for each label set, and we return
+		// the lowest of those values.
+		// Calculating the MinT this way makes remote queries resilient to cases where one tsdb replica would delete
+		// a block due to retention before other replicas did the same.
+		// See https://github.com/thanos-io/promql-engine/issues/187.
+		var (
+			mint = int64(math.MaxInt64)
+			maxt = r.client.tsdbInfos.MaxT()
+		)
 		for _, m := range highestMintByLabelSet {
 			if m < mint {
 				mint = m
 			}
 		}
-		r.mint = mint
-	})
 
+		r.mint = mint
+		r.maxt = maxt
+		r.labelSets = labelSets
+		r.partitionLabelSets = partitionLabelSets
+	})
+}
+
+func (r *remoteEngine) MinT() int64 {
+	r.init()
 	return r.mint
 }
 
 func (r *remoteEngine) MaxT() int64 {
-	r.maxtOnce.Do(func() {
-		r.maxt = r.client.tsdbInfos.MaxT()
-	})
+	r.init()
 	return r.maxt
 }
 
 func (r *remoteEngine) LabelSets() []labels.Labels {
-	r.labelSetsOnce.Do(func() {
-		r.labelSets = r.infosWithoutReplicaLabels().LabelSets()
-	})
+	r.init()
 	return r.labelSets
 }
 
-func (r *remoteEngine) infosWithoutReplicaLabels() infopb.TSDBInfos {
-	replicaLabelSet := make(map[string]struct{})
-	for _, lbl := range r.opts.ReplicaLabels {
-		replicaLabelSet[lbl] = struct{}{}
-	}
-
-	// Strip replica labels from the result.
-	infos := make(infopb.TSDBInfos, 0, len(r.client.tsdbInfos))
-	var builder labels.ScratchBuilder
-	for _, info := range r.client.tsdbInfos {
-		builder.Reset()
-		for _, lbl := range info.Labels.Labels {
-			if _, ok := replicaLabelSet[lbl.Name]; ok {
-				continue
-			}
-			builder.Add(lbl.Name, lbl.Value)
-		}
-		infos = append(infos, infopb.NewTSDBInfo(
-			info.MinTime,
-			info.MaxTime,
-			labelpb.ZLabelsFromPromLabels(builder.Labels())),
-		)
-	}
-
-	return infos
+func (r *remoteEngine) PartitionLabelSets() []labels.Labels {
+	r.init()
+	return r.partitionLabelSets
 }
 
 func (r *remoteEngine) NewRangeQuery(_ context.Context, _ promql.QueryOpts, plan api.RemoteQuery, start, end time.Time, interval time.Duration) (promql.Query, error) {
@@ -226,6 +282,15 @@ type remoteQuery struct {
 	samplesStats *stats.QuerySamples
 
 	cancel context.CancelFunc
+}
+
+func (r *remoteQuery) responseForError(err error) *promql.Result {
+	if r.opts.PartialResponse {
+		return &promql.Result{
+			Warnings: annotations.New().Add(fmt.Errorf("remote query error (%s): %s", r.remoteAddr, err)),
+		}
+	}
+	return &promql.Result{Err: err}
 }
 
 func (r *remoteQuery) Exec(ctx context.Context) *promql.Result {
@@ -274,23 +339,22 @@ func (r *remoteQuery) Exec(ctx context.Context) *promql.Result {
 	r.samplesStats = stats.NewQuerySamples(false)
 
 	// Instant query.
-	if r.start == r.end {
+	if r.start.Equal(r.end) {
 		request := &querypb.QueryRequest{
 			Query:                 r.plan.String(),
 			QueryPlan:             plan,
 			TimeSeconds:           r.start.Unix(),
 			TimeoutSeconds:        int64(r.opts.Timeout.Seconds()),
-			EnablePartialResponse: r.opts.EnablePartialResponse,
-			// TODO (fpetkovski): Allow specifying these parameters at query time.
-			// This will likely require a change in the remote engine interface.
-			ReplicaLabels:        r.opts.ReplicaLabels,
-			MaxResolutionSeconds: maxResolution,
-			EnableDedup:          true,
+			EnablePartialResponse: r.opts.PartialResponse,
+			ReplicaLabels:         r.opts.ReplicaLabels,
+			MaxResolutionSeconds:  maxResolution,
+			EnableDedup:           true,
+			ResponseBatchSize:     store.DefaultResponseBatchSize,
 		}
 
 		qry, err := r.client.Query(qctx, request)
 		if err != nil {
-			return &promql.Result{Err: err}
+			return r.responseForError(err)
 		}
 		var (
 			result   = make(promql.Vector, 0)
@@ -304,33 +368,44 @@ func (r *remoteQuery) Exec(ctx context.Context) *promql.Result {
 				break
 			}
 			if err != nil {
-				return &promql.Result{Err: err}
+				return r.responseForError(err)
 			}
 
 			if warn := msg.GetWarnings(); warn != "" {
-				warnings.Add(errors.New(warn))
+				warnings.Add(errors.Errorf("remote query warning (%s): %s", r.remoteAddr, warn))
 				continue
 			}
 			if s := msg.GetStats(); s != nil {
 				qryStats = *s
 				continue
 			}
-
-			ts := msg.GetTimeseries()
-			if ts == nil {
+			if batch := msg.GetTimeseriesBatch(); batch != nil {
+				for _, ts := range batch.Series {
+					builder.Reset()
+					for _, l := range ts.Labels {
+						builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
+					}
+					if len(ts.Histograms) > 0 {
+						result = append(result, promql.Sample{Metric: builder.Labels(), H: prompb.FromProtoHistogram(ts.Histograms[0]), T: r.start.UnixMilli()})
+					} else {
+						result = append(result, promql.Sample{Metric: builder.Labels(), F: ts.Samples[0].Value, T: r.start.UnixMilli()})
+					}
+				}
 				continue
 			}
-			builder.Reset()
-			for _, l := range ts.Labels {
-				builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
-			}
-			// Point might have a different timestamp, force it to the evaluation
-			// timestamp as that is when we ran the evaluation.
-			// See https://github.com/prometheus/prometheus/blob/b727e69b7601b069ded5c34348dca41b80988f4b/promql/engine.go#L693-L699
-			if len(ts.Histograms) > 0 {
-				result = append(result, promql.Sample{Metric: builder.Labels(), H: prompb.FromProtoHistogram(ts.Histograms[0]), T: r.start.UnixMilli()})
-			} else {
-				result = append(result, promql.Sample{Metric: builder.Labels(), F: ts.Samples[0].Value, T: r.start.UnixMilli()})
+			if ts := msg.GetTimeseries(); ts != nil {
+				builder.Reset()
+				for _, l := range ts.Labels {
+					builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
+				}
+				// Point might have a different timestamp, force it to the evaluation
+				// timestamp as that is when we ran the evaluation.
+				// See https://github.com/prometheus/prometheus/blob/b727e69b7601b069ded5c34348dca41b80988f4b/promql/engine.go#L693-L699
+				if len(ts.Histograms) > 0 {
+					result = append(result, promql.Sample{Metric: builder.Labels(), H: prompb.FromProtoHistogram(ts.Histograms[0]), T: r.start.UnixMilli()})
+				} else {
+					result = append(result, promql.Sample{Metric: builder.Labels(), F: ts.Samples[0].Value, T: r.start.UnixMilli()})
+				}
 			}
 		}
 		r.samplesStats.UpdatePeak(int(qryStats.PeakSamples))
@@ -349,16 +424,15 @@ func (r *remoteQuery) Exec(ctx context.Context) *promql.Result {
 		EndTimeSeconds:        r.end.Unix(),
 		IntervalSeconds:       int64(r.interval.Seconds()),
 		TimeoutSeconds:        int64(r.opts.Timeout.Seconds()),
-		EnablePartialResponse: r.opts.EnablePartialResponse,
-		// TODO (fpetkovski): Allow specifying these parameters at query time.
-		// This will likely require a change in the remote engine interface.
-		ReplicaLabels:        r.opts.ReplicaLabels,
-		MaxResolutionSeconds: maxResolution,
-		EnableDedup:          true,
+		EnablePartialResponse: r.opts.PartialResponse,
+		ReplicaLabels:         r.opts.ReplicaLabels,
+		MaxResolutionSeconds:  maxResolution,
+		EnableDedup:           true,
+		ResponseBatchSize:     store.DefaultResponseBatchSize,
 	}
 	qry, err := r.client.QueryRange(qctx, request)
 	if err != nil {
-		return &promql.Result{Err: err}
+		return r.responseForError(err)
 	}
 
 	var (
@@ -373,44 +447,68 @@ func (r *remoteQuery) Exec(ctx context.Context) *promql.Result {
 			break
 		}
 		if err != nil {
-			return &promql.Result{Err: err}
+			return r.responseForError(err)
 		}
 
 		if warn := msg.GetWarnings(); warn != "" {
-			warnings.Add(errors.New(warn))
+			warnings.Add(errors.Errorf("remote query warning (%s): %s", r.remoteAddr, warn))
 			continue
 		}
 		if s := msg.GetStats(); s != nil {
 			qryStats = *s
 			continue
 		}
-
-		ts := msg.GetTimeseries()
-		if ts == nil {
+		if batch := msg.GetTimeseriesBatch(); batch != nil {
+			for _, ts := range batch.Series {
+				builder.Reset()
+				for _, l := range ts.Labels {
+					builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
+				}
+				series := promql.Series{
+					Metric:     builder.Labels(),
+					Floats:     make([]promql.FPoint, 0, len(ts.Samples)),
+					Histograms: make([]promql.HPoint, 0, len(ts.Histograms)),
+				}
+				for _, s := range ts.Samples {
+					series.Floats = append(series.Floats, promql.FPoint{
+						T: s.Timestamp,
+						F: s.Value,
+					})
+				}
+				for _, hp := range ts.Histograms {
+					series.Histograms = append(series.Histograms, promql.HPoint{
+						T: hp.Timestamp,
+						H: prompb.FloatHistogramProtoToFloatHistogram(hp),
+					})
+				}
+				result = append(result, series)
+			}
 			continue
 		}
-		builder.Reset()
-		for _, l := range ts.Labels {
-			builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
+		if ts := msg.GetTimeseries(); ts != nil {
+			builder.Reset()
+			for _, l := range ts.Labels {
+				builder.Add(strings.Clone(l.Name), strings.Clone(l.Value))
+			}
+			series := promql.Series{
+				Metric:     builder.Labels(),
+				Floats:     make([]promql.FPoint, 0, len(ts.Samples)),
+				Histograms: make([]promql.HPoint, 0, len(ts.Histograms)),
+			}
+			for _, s := range ts.Samples {
+				series.Floats = append(series.Floats, promql.FPoint{
+					T: s.Timestamp,
+					F: s.Value,
+				})
+			}
+			for _, hp := range ts.Histograms {
+				series.Histograms = append(series.Histograms, promql.HPoint{
+					T: hp.Timestamp,
+					H: prompb.FloatHistogramProtoToFloatHistogram(hp),
+				})
+			}
+			result = append(result, series)
 		}
-		series := promql.Series{
-			Metric:     builder.Labels(),
-			Floats:     make([]promql.FPoint, 0, len(ts.Samples)),
-			Histograms: make([]promql.HPoint, 0, len(ts.Histograms)),
-		}
-		for _, s := range ts.Samples {
-			series.Floats = append(series.Floats, promql.FPoint{
-				T: s.Timestamp,
-				F: s.Value,
-			})
-		}
-		for _, hp := range ts.Histograms {
-			series.Histograms = append(series.Histograms, promql.HPoint{
-				T: hp.Timestamp,
-				H: prompb.FloatHistogramProtoToFloatHistogram(hp),
-			})
-		}
-		result = append(result, series)
 	}
 	r.samplesStats.UpdatePeak(int(qryStats.PeakSamples))
 	r.samplesStats.TotalSamples = qryStats.SamplesTotal

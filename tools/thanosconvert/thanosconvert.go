@@ -16,12 +16,13 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 // ThanosBlockConverter converts blocks written by Thanos to make them readable by Cortex
 type ThanosBlockConverter struct {
 	logger log.Logger
-	bkt    objstore.Bucket
+	bkt    objstore.InstrumentedBucket
 	dryRun bool
 }
 
@@ -44,7 +45,7 @@ type Results map[string]PerUserResults
 
 // NewThanosBlockConverter creates a ThanosBlockConverter
 func NewThanosBlockConverter(ctx context.Context, cfg bucket.Config, dryRun bool, logger log.Logger) (*ThanosBlockConverter, error) {
-	bkt, err := bucket.NewClient(ctx, cfg, "thanosconvert", logger, nil)
+	bkt, err := bucket.NewClient(ctx, cfg, nil, "thanosconvert", logger, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -60,8 +61,11 @@ func NewThanosBlockConverter(ctx context.Context, cfg bucket.Config, dryRun bool
 func (c ThanosBlockConverter) Run(ctx context.Context) (Results, error) {
 	results := make(Results)
 
-	scanner := cortex_tsdb.NewUsersScanner(c.bkt, cortex_tsdb.AllUsers, c.logger)
-	users, _, err := scanner.ScanUsers(ctx)
+	// Hardcode user scan strategy to list.
+	// We can safely ignore the error as it only fails if the strategy is not supported.
+	usersScanner, _ := users.NewScanner(users.UsersScannerConfig{Strategy: users.UserScanStrategyList}, c.bkt, c.logger, nil)
+	// Only active users are considered.
+	users, _, _, err := usersScanner.ScanUsers(ctx)
 	if err != nil {
 		return results, errors.Wrap(err, "error while scanning users")
 	}

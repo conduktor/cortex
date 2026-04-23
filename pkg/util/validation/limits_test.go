@@ -2,6 +2,7 @@ package validation
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,9 +45,11 @@ func TestLimits_Validate(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		limits           Limits
-		shardByAllLabels bool
-		expected         error
+		limits                     Limits
+		shardByAllLabels           bool
+		activeSeriesMetricsEnabled bool
+		expected                   error
+		nameValidationScheme       model.ValidationScheme
 	}{
 		"max-global-series-per-user disabled and shard-by-all-labels=false": {
 			limits:           Limits{MaxGlobalSeriesPerUser: 0},
@@ -62,13 +66,135 @@ func TestLimits_Validate(t *testing.T) {
 			shardByAllLabels: true,
 			expected:         nil,
 		},
+		"max-global-native-histogram-series-per-user disabled and shard-by-all-labels=false and active-series-metrics-enabled=false": {
+			limits:                     Limits{MaxGlobalSeriesPerUser: 0},
+			shardByAllLabels:           false,
+			activeSeriesMetricsEnabled: false,
+			expected:                   nil,
+		},
+		"max-global-native-histogram-series-per-user disabled and shard-by-all-labels=true and active-series-metrics-enabled=true": {
+			limits:                     Limits{MaxGlobalNativeHistogramSeriesPerUser: 0},
+			shardByAllLabels:           true,
+			activeSeriesMetricsEnabled: true,
+			expected:                   nil,
+		},
+		"max-global-native-histogram-series-per-user enabled and shard-by-all-labels=true and active-series-metrics-enabled=true": {
+			limits:                     Limits{MaxGlobalNativeHistogramSeriesPerUser: 1000},
+			shardByAllLabels:           true,
+			activeSeriesMetricsEnabled: true,
+			expected:                   nil,
+		},
+		"max-global-native-histogram-series-per-user enabled and shard-by-all-labels=false and active-series-metrics-enabled=true": {
+			limits:                     Limits{MaxGlobalNativeHistogramSeriesPerUser: 1000},
+			shardByAllLabels:           false,
+			activeSeriesMetricsEnabled: true,
+			expected:                   errMaxGlobalNativeHistogramSeriesPerUserValidation,
+		},
+		"max-global-native-histogram-series-per-user enabled and shard-by-all-labels=true and active-series-metrics-enabled=false": {
+			limits:                     Limits{MaxGlobalNativeHistogramSeriesPerUser: 1000},
+			shardByAllLabels:           true,
+			activeSeriesMetricsEnabled: false,
+			expected:                   errMaxGlobalNativeHistogramSeriesPerUserValidation,
+		},
+		"max-local-native-histogram-series-per-user disabled and shard-by-all-labels=true and active-series-metrics-enabled=false": {
+			limits:                     Limits{MaxLocalNativeHistogramSeriesPerUser: 0},
+			activeSeriesMetricsEnabled: false,
+			expected:                   nil,
+		},
+		"max-local-native-histogram-series-per-user disabled and shard-by-all-labels=true and active-series-metrics-enabled=true": {
+			limits:                     Limits{MaxLocalNativeHistogramSeriesPerUser: 0},
+			activeSeriesMetricsEnabled: true,
+			expected:                   nil,
+		},
+		"max-local-native-histogram-series-per-user enabled and shard-by-all-labels=true and active-series-metrics-enabled=true": {
+			limits:                     Limits{MaxLocalNativeHistogramSeriesPerUser: 1000},
+			activeSeriesMetricsEnabled: true,
+			expected:                   nil,
+		},
+		"max-local-native-histogram-series-per-user enabled and shard-by-all-labels=true and active-series-metrics-enabled=false": {
+			limits:                     Limits{MaxLocalNativeHistogramSeriesPerUser: 1000},
+			activeSeriesMetricsEnabled: false,
+			expected:                   errMaxLocalNativeHistogramSeriesPerUserValidation,
+		},
+		"external-labels invalid label name": {
+			limits:   Limits{RulerExternalLabels: labels.FromStrings("123invalid", "good")},
+			expected: errInvalidLabelName,
+		},
+		"external-labels invalid label value": {
+			limits:   Limits{RulerExternalLabels: labels.FromStrings("good", string([]byte{0xff, 0xfe, 0xfd}))},
+			expected: errInvalidLabelValue,
+		},
+		"utf8: external-labels utf8 label name and value": {
+			limits:               Limits{RulerExternalLabels: labels.FromStrings("test.utf8.metric", "😄")},
+			expected:             nil,
+			nameValidationScheme: model.UTF8Validation,
+		},
+		"utf8: external-labels invalid label name": {
+			limits:               Limits{RulerExternalLabels: labels.FromStrings("test.\xc5.metric", "😄")},
+			expected:             errInvalidLabelName,
+			nameValidationScheme: model.UTF8Validation,
+		},
+		"utf8: external-labels invalid label value": {
+			limits:               Limits{RulerExternalLabels: labels.FromStrings("test.utf8.metric", "test.\xc5.value")},
+			expected:             errInvalidLabelValue,
+			nameValidationScheme: model.UTF8Validation,
+		},
+		"metric_relabel_configs nil entry": {
+			limits: Limits{
+				MetricRelabelConfigs: []*relabel.Config{nil},
+			},
+			expected: errInvalidMetricRelabelConfigs,
+		},
+		"metric_relabel_configs valid config": {
+			limits: Limits{
+				MetricRelabelConfigs: []*relabel.Config{
+					{
+						SourceLabels:         []model.LabelName{"__name__"},
+						Action:               relabel.Drop,
+						Regex:                relabel.MustNewRegexp("(foo)"),
+						NameValidationScheme: model.LegacyValidation,
+					},
+				},
+			},
+			expected: nil,
+		},
+		"metric_relabel_configs invalid config empty action": {
+			limits: Limits{
+				MetricRelabelConfigs: []*relabel.Config{
+					{
+						SourceLabels:         []model.LabelName{"__name__"},
+						Action:               "",
+						Regex:                relabel.DefaultRelabelConfig.Regex,
+						NameValidationScheme: model.LegacyValidation,
+					},
+				},
+			},
+			expected: errInvalidMetricRelabelConfigs,
+		},
+		"metric_relabel_configs invalid target_label for legacy": {
+			limits: Limits{
+				MetricRelabelConfigs: []*relabel.Config{
+					{
+						SourceLabels:         []model.LabelName{"cluster"},
+						Action:               relabel.Replace,
+						Regex:                relabel.DefaultRelabelConfig.Regex,
+						TargetLabel:          "invalid-label-with-dash",
+						Replacement:          "x",
+						NameValidationScheme: model.LegacyValidation,
+					},
+				},
+			},
+			expected: errInvalidMetricRelabelConfigs,
+		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
-			assert.Equal(t, testData.expected, testData.limits.Validate(testData.shardByAllLabels))
+			nameValidationScheme := model.LegacyValidation
+			if testData.nameValidationScheme == model.UTF8Validation {
+				nameValidationScheme = testData.nameValidationScheme
+			}
+			assert.ErrorIs(t, testData.limits.Validate(nameValidationScheme, testData.shardByAllLabels, testData.activeSeriesMetricsEnabled), testData.expected)
 		})
 	}
 }
@@ -77,8 +203,7 @@ func TestOverrides_MaxChunksPerQueryFromStore(t *testing.T) {
 	limits := Limits{}
 	flagext.DefaultValues(&limits)
 
-	overrides, err := NewOverrides(limits, nil)
-	require.NoError(t, err)
+	overrides := NewOverrides(limits, nil)
 	assert.Equal(t, 2000000, overrides.MaxChunksPerQueryFromStore("test"))
 }
 
@@ -88,8 +213,7 @@ func TestOverridesManager_GetOverrides(t *testing.T) {
 	defaults := Limits{
 		MaxLabelNamesPerSeries: 100,
 	}
-	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
-	require.NoError(t, err)
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
 
 	require.Equal(t, 100, ov.MaxLabelNamesPerSeries("user1"))
 	require.Equal(t, 0, ov.MaxLabelValueLength("user1"))
@@ -154,11 +278,11 @@ func TestLimitsLoadingFromJson(t *testing.T) {
 }
 
 func TestLimitsTagsYamlMatchJson(t *testing.T) {
-	limits := reflect.TypeOf(Limits{})
+	limits := reflect.TypeFor[Limits]()
 	n := limits.NumField()
 	var mismatch []string
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		field := limits.Field(i)
 
 		// Note that we aren't requiring YAML and JSON tags to match, just that
@@ -187,7 +311,7 @@ limits_per_label_set:
 	err := yaml.Unmarshal([]byte(inputYAML), &limitsYAML)
 	require.NoError(t, err)
 	require.Len(t, limitsYAML.LimitsPerLabelSet, 1)
-	require.Len(t, limitsYAML.LimitsPerLabelSet[0].LabelSet, 1)
+	require.Equal(t, 1, limitsYAML.LimitsPerLabelSet[0].LabelSet.Len())
 	require.Equal(t, limitsYAML.LimitsPerLabelSet[0].Limits.MaxSeries, 10)
 
 	duplicatedInputYAML := `
@@ -224,12 +348,12 @@ max_query_length: 1s
 }
 
 func TestLimitsAlwaysUsesPromDuration(t *testing.T) {
-	stdlibDuration := reflect.TypeOf(time.Duration(0))
-	limits := reflect.TypeOf(Limits{})
+	stdlibDuration := reflect.TypeFor[time.Duration]()
+	limits := reflect.TypeFor[Limits]()
 	n := limits.NumField()
 	var badDurationType []string
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		field := limits.Field(i)
 		if field.Type == stdlibDuration {
 			badDurationType = append(badDurationType, field.Name)
@@ -275,8 +399,7 @@ func TestSmallestPositiveIntPerTenant(t *testing.T) {
 	defaults := Limits{
 		MaxQueryParallelism: 0,
 	}
-	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
-	require.NoError(t, err)
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
 
 	for _, tc := range []struct {
 		tenantIDs []string
@@ -307,8 +430,7 @@ func TestSmallestPositiveNonZeroFloat64PerTenant(t *testing.T) {
 	defaults := Limits{
 		MaxQueriersPerTenant: 0,
 	}
-	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
-	require.NoError(t, err)
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
 
 	for _, tc := range []struct {
 		tenantIDs []string
@@ -339,8 +461,7 @@ func TestSmallestPositiveNonZeroDurationPerTenant(t *testing.T) {
 	defaults := Limits{
 		MaxQueryLength: 0,
 	}
-	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
-	require.NoError(t, err)
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
 
 	for _, tc := range []struct {
 		tenantIDs []string
@@ -414,8 +535,7 @@ alertmanager_notification_rate_limit_per_integration:
 			err := yaml.Unmarshal([]byte(tc.inputYAML), &limitsYAML)
 			require.NoError(t, err, "expected to be able to unmarshal from YAML")
 
-			ov, err := NewOverrides(limitsYAML, nil)
-			require.NoError(t, err)
+			ov := NewOverrides(limitsYAML, nil)
 
 			require.Equal(t, tc.expectedRateLimit, ov.NotificationRateLimit("user", "email"))
 			require.Equal(t, tc.expectedBurstSize, ov.NotificationBurstSize("user", "email"))
@@ -556,8 +676,7 @@ testuser:
 
 			tl := newMockTenantLimits(overrides)
 
-			ov, err := NewOverrides(limitsYAML, tl)
-			require.NoError(t, err)
+			ov := NewOverrides(limitsYAML, tl)
 
 			require.Equal(t, tc.expectedRateLimit, ov.NotificationRateLimit("testuser", tc.testedIntegration))
 			require.Equal(t, tc.expectedBurstSize, ov.NotificationBurstSize("testuser", tc.testedIntegration))
@@ -589,8 +708,7 @@ tenant2:
 
 	tl := newMockTenantLimits(overrides)
 
-	ov, err := NewOverrides(l, tl)
-	require.NoError(t, err)
+	ov := NewOverrides(l, tl)
 
 	require.Equal(t, 1, ov.MaxExemplars("tenant1"))
 	require.Equal(t, 3, ov.MaxExemplars("tenant2"))
@@ -621,12 +739,44 @@ tenant2:
 
 	tl := newMockTenantLimits(overrides)
 
-	ov, err := NewOverrides(l, tl)
-	require.NoError(t, err)
+	ov := NewOverrides(l, tl)
 
 	require.Equal(t, 1, ov.MaxDownloadedBytesPerRequest("tenant1"))
 	require.Equal(t, 3, ov.MaxDownloadedBytesPerRequest("tenant2"))
 	require.Equal(t, 5, ov.MaxDownloadedBytesPerRequest("tenant3"))
+}
+
+func TestPartialDataOverridesPerTenant(t *testing.T) {
+	SetDefaultLimitsForYAMLUnmarshalling(Limits{})
+
+	baseYAML := `
+query_partial_data: false
+rules_partial_data: false`
+	overridesYAML := `
+tenant1:
+  query_partial_data: true
+tenant2:
+  query_partial_data: true
+  rules_partial_data: true`
+
+	l := Limits{}
+	err := yaml.UnmarshalStrict([]byte(baseYAML), &l)
+	require.NoError(t, err)
+
+	overrides := map[string]*Limits{}
+	err = yaml.Unmarshal([]byte(overridesYAML), &overrides)
+	require.NoError(t, err, "parsing overrides")
+
+	tl := newMockTenantLimits(overrides)
+
+	ov := NewOverrides(l, tl)
+
+	require.True(t, ov.QueryPartialData("tenant1"))
+	require.False(t, ov.RulesPartialData("tenant1"))
+	require.True(t, ov.QueryPartialData("tenant2"))
+	require.True(t, ov.RulesPartialData("tenant2"))
+	require.False(t, ov.QueryPartialData("tenant3"))
+	require.False(t, ov.RulesPartialData("tenant3"))
 }
 
 func TestHasQueryAttributeRegexChanged(t *testing.T) {
@@ -776,9 +926,344 @@ func TestEvaluationDelayHigherThanRulerQueryOffset(t *testing.T) {
 	}
 
 	defaults := Limits{}
-	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
-	require.NoError(t, err)
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
 
 	rulerQueryOffset := ov.RulerQueryOffset(tenant)
 	assert.Equal(t, evaluationDelay, rulerQueryOffset)
+}
+
+func TestLimitsPerLabelSetsForSeries(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		limits         []LimitsPerLabelSet
+		metric         labels.Labels
+		expectedLimits []LimitsPerLabelSet
+	}{
+		{
+			name:   "no limits",
+			metric: labels.FromMap(map[string]string{"foo": "bar"}),
+		},
+		{
+			name:   "no limits matched",
+			metric: labels.FromMap(map[string]string{"foo": "bar"}),
+			limits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "baz"})},
+			},
+			expectedLimits: []LimitsPerLabelSet{},
+		},
+		{
+			name:   "one limit matched",
+			metric: labels.FromMap(map[string]string{"foo": "bar"}),
+			limits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "baz"})},
+				{LabelSet: labels.FromMap(map[string]string{"foo": "bar"})},
+			},
+			expectedLimits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "bar"})},
+			},
+		},
+		{
+			name:   "default limit matched",
+			metric: labels.FromMap(map[string]string{"foo": "bar"}),
+			limits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "baz"})},
+				{LabelSet: labels.FromMap(map[string]string{})},
+			},
+			expectedLimits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{})},
+			},
+		},
+		{
+			name:   "one limit matched so not picking default limit",
+			metric: labels.FromMap(map[string]string{"foo": "bar", "cluster": "us-west-2"}),
+			limits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "bar", "cluster": "us-west-2"})},
+				{LabelSet: labels.FromMap(map[string]string{})},
+			},
+			expectedLimits: []LimitsPerLabelSet{
+				{LabelSet: labels.FromMap(map[string]string{"foo": "bar", "cluster": "us-west-2"})},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			matched := LimitsPerLabelSetsForSeries(tc.limits, tc.metric)
+			require.Equal(t, tc.expectedLimits, matched)
+		})
+	}
+}
+
+func TestIsLimitError(t *testing.T) {
+	assert.False(t, IsLimitError(fmt.Errorf("test error")))
+	assert.True(t, IsLimitError(LimitError("test error")))
+}
+func TestLimits_ValidateQueryLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		queryIngestersWithin                   time.Duration
+		queryStoreAfter                        time.Duration
+		shuffleShardingIngestersLookbackPeriod time.Duration
+		closeIdleTSDBTimeout                   time.Duration
+		expectedError                          string
+	}{
+		"all limits disabled (zero values) should be valid": {
+			queryIngestersWithin:                   0,
+			queryStoreAfter:                        0,
+			shuffleShardingIngestersLookbackPeriod: 0,
+			closeIdleTSDBTimeout:                   0,
+			expectedError:                          "",
+		},
+		"valid configuration with all limits enabled": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "",
+		},
+		"valid configuration with overlap for safety": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        23 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 26 * time.Hour,
+			closeIdleTSDBTimeout:                   30 * time.Hour,
+			expectedError:                          "",
+		},
+		"valid configuration with only queryIngestersWithin enabled": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        0,
+			shuffleShardingIngestersLookbackPeriod: 0,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "",
+		},
+		"valid configuration with only queryStoreAfter enabled": {
+			queryIngestersWithin:                   0,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   0,
+			expectedError:                          "",
+		},
+		"invalid: queryIngestersWithin >= closeIdleTSDBTimeout": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   25 * time.Hour,
+			expectedError:                          "query_ingesters_within (25h0m0s) must be less than close_idle_tsdb_timeout (25h0m0s)",
+		},
+		"invalid: queryIngestersWithin > closeIdleTSDBTimeout": {
+			queryIngestersWithin:                   26 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 26 * time.Hour,
+			closeIdleTSDBTimeout:                   25 * time.Hour,
+			expectedError:                          "query_ingesters_within (26h0m0s) must be less than close_idle_tsdb_timeout (25h0m0s)",
+		},
+		"invalid: queryStoreAfter >= queryIngestersWithin": {
+			queryIngestersWithin:                   24 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "query_store_after (24h0m0s) must be less than query_ingesters_within (24h0m0s)",
+		},
+		"invalid: queryStoreAfter > queryIngestersWithin": {
+			queryIngestersWithin:                   24 * time.Hour,
+			queryStoreAfter:                        25 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 26 * time.Hour,
+			closeIdleTSDBTimeout:                   27 * time.Hour,
+			expectedError:                          "query_store_after (25h0m0s) must be less than query_ingesters_within (24h0m0s)",
+		},
+		"invalid: shuffleShardingLookback < queryStoreAfter": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 20 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "shuffle_sharding_ingesters_lookback_period (20h0m0s) is less than query_store_after (24h0m0s)",
+		},
+		"valid: shuffleShardingLookback between queryStoreAfter and queryIngestersWithin": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        20 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 22 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "",
+		},
+		"boundary: queryIngestersWithin exactly 1ms less than closeIdleTSDBTimeout": {
+			queryIngestersWithin:                   25*time.Hour - time.Millisecond,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   25 * time.Hour,
+			expectedError:                          "",
+		},
+		"boundary: queryStoreAfter exactly 1ms less than queryIngestersWithin": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        25*time.Hour - time.Millisecond,
+			shuffleShardingIngestersLookbackPeriod: 25 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "",
+		},
+		"boundary: shuffleShardingLookback exactly equal to queryStoreAfter": {
+			queryIngestersWithin:                   25 * time.Hour,
+			queryStoreAfter:                        24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 24 * time.Hour,
+			closeIdleTSDBTimeout:                   26 * time.Hour,
+			expectedError:                          "",
+		},
+		"edge case: very large values": {
+			queryIngestersWithin:                   365 * 24 * time.Hour, // 1 year
+			queryStoreAfter:                        364 * 24 * time.Hour,
+			shuffleShardingIngestersLookbackPeriod: 365 * 24 * time.Hour,
+			closeIdleTSDBTimeout:                   366 * 24 * time.Hour,
+			expectedError:                          "",
+		},
+		"edge case: very small values": {
+			queryIngestersWithin:                   2 * time.Second,
+			queryStoreAfter:                        1 * time.Second,
+			shuffleShardingIngestersLookbackPeriod: 2 * time.Second,
+			closeIdleTSDBTimeout:                   3 * time.Second,
+			expectedError:                          "",
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			limits := Limits{
+				QueryIngestersWithin:                   model.Duration(testData.queryIngestersWithin),
+				QueryStoreAfter:                        model.Duration(testData.queryStoreAfter),
+				ShuffleShardingIngestersLookbackPeriod: model.Duration(testData.shuffleShardingIngestersLookbackPeriod),
+			}
+
+			err := limits.ValidateQueryLimits("test-tenant", testData.closeIdleTSDBTimeout)
+
+			if testData.expectedError == "" {
+				assert.NoError(t, err, "expected no error but got: %v", err)
+			} else {
+				assert.Error(t, err, "expected error but got none")
+				if err != nil {
+					assert.Contains(t, err.Error(), testData.expectedError, "error message mismatch")
+				}
+			}
+		})
+	}
+}
+
+func TestQueryLimits_TenantOverrides(t *testing.T) {
+	t.Parallel()
+
+	// Setup: Create three tenants with different query limit configurations
+	tenantLimits := map[string]*Limits{
+		"tenant-a": {
+			QueryIngestersWithin:                   model.Duration(1 * time.Hour),
+			QueryStoreAfter:                        model.Duration(30 * time.Minute),
+			ShuffleShardingIngestersLookbackPeriod: model.Duration(1 * time.Hour),
+		},
+		"tenant-b": {
+			QueryIngestersWithin:                   model.Duration(2 * time.Hour),
+			QueryStoreAfter:                        model.Duration(1 * time.Hour),
+			ShuffleShardingIngestersLookbackPeriod: model.Duration(2 * time.Hour),
+		},
+		"tenant-c": {
+			// Uses defaults (all zeros - disabled)
+			QueryIngestersWithin:                   0,
+			QueryStoreAfter:                        0,
+			ShuffleShardingIngestersLookbackPeriod: 0,
+		},
+	}
+
+	defaults := Limits{
+		QueryIngestersWithin:                   model.Duration(25 * time.Hour),
+		QueryStoreAfter:                        model.Duration(24 * time.Hour),
+		ShuffleShardingIngestersLookbackPeriod: model.Duration(25 * time.Hour),
+	}
+
+	ov := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
+
+	// Verify tenant-a gets their specific limits
+	assert.Equal(t, 1*time.Hour, ov.QueryIngestersWithin("tenant-a"))
+	assert.Equal(t, 30*time.Minute, ov.QueryStoreAfter("tenant-a"))
+	assert.Equal(t, 1*time.Hour, ov.ShuffleShardingIngestersLookbackPeriod("tenant-a"))
+
+	// Verify tenant-b gets their specific limits
+	assert.Equal(t, 2*time.Hour, ov.QueryIngestersWithin("tenant-b"))
+	assert.Equal(t, 1*time.Hour, ov.QueryStoreAfter("tenant-b"))
+	assert.Equal(t, 2*time.Hour, ov.ShuffleShardingIngestersLookbackPeriod("tenant-b"))
+
+	// Verify tenant-c gets their specific limits (zeros)
+	assert.Equal(t, time.Duration(0), ov.QueryIngestersWithin("tenant-c"))
+	assert.Equal(t, time.Duration(0), ov.QueryStoreAfter("tenant-c"))
+	assert.Equal(t, time.Duration(0), ov.ShuffleShardingIngestersLookbackPeriod("tenant-c"))
+
+	// Verify unknown tenant gets defaults
+	assert.Equal(t, 25*time.Hour, ov.QueryIngestersWithin("tenant-unknown"))
+	assert.Equal(t, 24*time.Hour, ov.QueryStoreAfter("tenant-unknown"))
+	assert.Equal(t, 25*time.Hour, ov.ShuffleShardingIngestersLookbackPeriod("tenant-unknown"))
+}
+
+func TestQueryLimits_TenantOverridesValidation(t *testing.T) {
+	t.Parallel()
+
+	closeIdleTSDBTimeout := 26 * time.Hour
+
+	tests := map[string]struct {
+		tenantLimits  map[string]*Limits
+		tenantID      string
+		expectedError string
+	}{
+		"valid tenant configuration": {
+			tenantLimits: map[string]*Limits{
+				"valid-tenant": {
+					QueryIngestersWithin:                   model.Duration(25 * time.Hour),
+					QueryStoreAfter:                        model.Duration(24 * time.Hour),
+					ShuffleShardingIngestersLookbackPeriod: model.Duration(25 * time.Hour),
+				},
+			},
+			tenantID:      "valid-tenant",
+			expectedError: "",
+		},
+		"invalid tenant: queryStoreAfter >= queryIngestersWithin": {
+			tenantLimits: map[string]*Limits{
+				"invalid-tenant": {
+					QueryIngestersWithin:                   model.Duration(24 * time.Hour),
+					QueryStoreAfter:                        model.Duration(25 * time.Hour),
+					ShuffleShardingIngestersLookbackPeriod: model.Duration(26 * time.Hour),
+				},
+			},
+			tenantID:      "invalid-tenant",
+			expectedError: "query_store_after (25h0m0s) must be less than query_ingesters_within (24h0m0s)",
+		},
+		"invalid tenant: queryIngestersWithin >= closeIdleTSDBTimeout": {
+			tenantLimits: map[string]*Limits{
+				"invalid-tenant": {
+					QueryIngestersWithin:                   model.Duration(26 * time.Hour),
+					QueryStoreAfter:                        model.Duration(24 * time.Hour),
+					ShuffleShardingIngestersLookbackPeriod: model.Duration(26 * time.Hour),
+				},
+			},
+			tenantID:      "invalid-tenant",
+			expectedError: "query_ingesters_within (26h0m0s) must be less than close_idle_tsdb_timeout (26h0m0s)",
+		},
+		"invalid tenant: shuffleShardingLookback < queryStoreAfter": {
+			tenantLimits: map[string]*Limits{
+				"invalid-tenant": {
+					QueryIngestersWithin:                   model.Duration(25 * time.Hour),
+					QueryStoreAfter:                        model.Duration(24 * time.Hour),
+					ShuffleShardingIngestersLookbackPeriod: model.Duration(20 * time.Hour),
+				},
+			},
+			tenantID:      "invalid-tenant",
+			expectedError: "shuffle_sharding_ingesters_lookback_period (20h0m0s) is less than query_store_after (24h0m0s)",
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			limits := testData.tenantLimits[testData.tenantID]
+			err := limits.ValidateQueryLimits(testData.tenantID, closeIdleTSDBTimeout)
+
+			if testData.expectedError == "" {
+				assert.NoError(t, err, "expected no error but got: %v", err)
+			} else {
+				assert.Error(t, err, "expected error but got none")
+				if err != nil {
+					assert.Contains(t, err.Error(), testData.expectedError, "error message mismatch")
+					assert.Contains(t, err.Error(), testData.tenantID, "error should contain tenant ID")
+				}
+			}
+		})
+	}
 }

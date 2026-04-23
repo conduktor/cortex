@@ -21,11 +21,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/efficientgo/core/errors"
-	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/promql/parser"
-	promstorage "github.com/prometheus/prometheus/storage"
-
 	"github.com/thanos-io/promql-engine/execution/aggregate"
 	"github.com/thanos-io/promql-engine/execution/binary"
 	"github.com/thanos-io/promql-engine/execution/exchange"
@@ -40,6 +35,11 @@ import (
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
 	"github.com/thanos-io/promql-engine/storage"
+
+	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
+	promstorage "github.com/prometheus/prometheus/storage"
 )
 
 // New creates new physical query execution for a given query expression which represents logical plan.
@@ -56,7 +56,7 @@ func New(ctx context.Context, expr logicalplan.Node, storage storage.Scanners, o
 func newOperator(ctx context.Context, expr logicalplan.Node, storage storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
 	switch e := expr.(type) {
 	case *logicalplan.NumberLiteral:
-		return scan.NewNumberLiteralSelector(model.NewVectorPool(opts.StepsBatch), opts, e.Val), nil
+		return scan.NewNumberLiteralSelector(opts, e.Val), nil
 	case *logicalplan.VectorSelector:
 		return newVectorSelector(ctx, e, storage, opts, hints)
 	case *logicalplan.FunctionCall:
@@ -80,7 +80,7 @@ func newOperator(ctx context.Context, expr logicalplan.Node, storage storage.Sca
 	case logicalplan.Noop:
 		return noop.NewOperator(opts), nil
 	case logicalplan.UserDefinedExpr:
-		return e.MakeExecutionOperator(ctx, model.NewVectorPool(opts.StepsBatch), opts, hints)
+		return e.MakeExecutionOperator(ctx, opts, hints)
 	default:
 		return nil, errors.Wrapf(parse.ErrNotSupportedExpr, "got: %s (%T)", e, e)
 	}
@@ -178,7 +178,7 @@ func newRangeVectorFunction(ctx context.Context, e *logicalplan.FunctionCall, t 
 	// TODO(saswatamcode): Range vector result might need new operator
 	// before it can be non-nested. https://github.com/thanos-io/promql-engine/issues/39
 	milliSecondRange := t.Range.Milliseconds()
-	if function.IsExtFunction(e.Func.Name) {
+	if parse.IsExtFunction(e.Func.Name) {
 		milliSecondRange += opts.ExtLookbackDelta.Milliseconds()
 	}
 
@@ -213,6 +213,7 @@ func newSubqueryFunction(ctx context.Context, e *logicalplan.FunctionCall, t *lo
 	}
 
 	var scalarArg model.VectorOperator
+	var scalarArg2 model.VectorOperator
 	switch e.Func.Name {
 	case "quantile_over_time":
 		// quantile_over_time(scalar, range-vector)
@@ -226,9 +227,19 @@ func newSubqueryFunction(ctx context.Context, e *logicalplan.FunctionCall, t *lo
 		if err != nil {
 			return nil, err
 		}
+	case "double_exponential_smoothing":
+		// double_exponential_smoothing(range-vector, scalar, scalar)
+		scalarArg, err = newOperator(ctx, e.Args[1], storage, opts, hints)
+		if err != nil {
+			return nil, err
+		}
+		scalarArg2, err = newOperator(ctx, e.Args[2], storage, opts, hints)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return scan.NewSubqueryOperator(model.NewVectorPool(opts.StepsBatch), inner, scalarArg, &outerOpts, e, t)
+	return scan.NewSubqueryOperator(inner, scalarArg, scalarArg2, &outerOpts, e, t)
 }
 
 func newInstantVectorFunction(ctx context.Context, e *logicalplan.FunctionCall, storage storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
@@ -259,22 +270,22 @@ func newAggregateExpression(ctx context.Context, e *logicalplan.Aggregation, sca
 	}
 	if e.Op == parser.COUNT_VALUES {
 		param := logicalplan.UnsafeUnwrapString(e.Param)
-		return aggregate.NewCountValues(model.NewVectorPool(opts.StepsBatch), next, param, !e.Without, e.Grouping, opts), nil
+		return aggregate.NewCountValues(next, param, !e.Without, e.Grouping, opts), nil
 	}
 
-	// parameter is only required for count_values, quantile, topk and bottomk.
+	// parameter is only required for count_values, quantile, topk, bottomk, limitk, and limit_ratio.
 	var paramOp model.VectorOperator
 	switch e.Op {
-	case parser.QUANTILE, parser.TOPK, parser.BOTTOMK:
+	case parser.QUANTILE, parser.TOPK, parser.BOTTOMK, parser.LIMITK, parser.LIMIT_RATIO:
 		paramOp, err = newOperator(ctx, e.Param, scanners, opts, hints)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if e.Op == parser.TOPK || e.Op == parser.BOTTOMK {
-		next, err = aggregate.NewKHashAggregate(model.NewVectorPool(opts.StepsBatch), next, paramOp, e.Op, !e.Without, e.Grouping, opts)
+	if e.Op == parser.TOPK || e.Op == parser.BOTTOMK || e.Op == parser.LIMITK || e.Op == parser.LIMIT_RATIO {
+		next, err = aggregate.NewKHashAggregate(next, paramOp, e.Op, !e.Without, e.Grouping, opts)
 	} else {
-		next, err = aggregate.NewHashAggregate(model.NewVectorPool(opts.StepsBatch), next, paramOp, e.Op, !e.Without, e.Grouping, opts)
+		next, err = aggregate.NewHashAggregate(next, paramOp, e.Op, !e.Without, e.Grouping, opts)
 	}
 	if err != nil {
 		return nil, err
@@ -299,7 +310,7 @@ func newVectorBinaryOperator(ctx context.Context, e *logicalplan.Binary, storage
 	if err != nil {
 		return nil, err
 	}
-	return binary.NewVectorOperator(model.NewVectorPool(opts.StepsBatch), leftOperator, rightOperator, e.VectorMatching, e.Op, e.ReturnBool, opts)
+	return binary.NewVectorOperator(leftOperator, rightOperator, e.VectorMatching, e.Op, e.ReturnBool, opts)
 }
 
 func newScalarBinaryOperator(ctx context.Context, e *logicalplan.Binary, storage storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
@@ -312,15 +323,7 @@ func newScalarBinaryOperator(ctx context.Context, e *logicalplan.Binary, storage
 		return nil, err
 	}
 
-	scalarSide := binary.ScalarSideRight
-	if e.LHS.ReturnType() == parser.ValueTypeScalar && e.RHS.ReturnType() == parser.ValueTypeScalar {
-		scalarSide = binary.ScalarSideBoth
-	} else if e.LHS.ReturnType() == parser.ValueTypeScalar {
-		rhs, lhs = lhs, rhs
-		scalarSide = binary.ScalarSideLeft
-	}
-
-	return binary.NewScalar(model.NewVectorPoolWithSize(opts.StepsBatch, 1), lhs, rhs, e.Op, scalarSide, e.ReturnBool, opts)
+	return binary.NewScalar(lhs, rhs, e.LHS.ReturnType(), e.RHS.ReturnType(), e.Op, e.ReturnBool, opts)
 }
 
 func newUnaryExpression(ctx context.Context, e *logicalplan.Unary, scanners storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
@@ -343,13 +346,13 @@ func newUnaryExpression(ctx context.Context, e *logicalplan.Unary, scanners stor
 func newStepInvariantExpression(ctx context.Context, e *logicalplan.StepInvariantExpr, scanners storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
 	switch t := e.Expr.(type) {
 	case *logicalplan.NumberLiteral:
-		return scan.NewNumberLiteralSelector(model.NewVectorPool(opts.StepsBatch), opts, t.Val), nil
+		return scan.NewNumberLiteralSelector(opts, t.Val), nil
 	}
 	next, err := newOperator(ctx, e.Expr, scanners, opts.WithEndTime(opts.Start), hints)
 	if err != nil {
 		return nil, err
 	}
-	return step_invariant.NewStepInvariantOperator(model.NewVectorPoolWithSize(opts.StepsBatch, 1), next, e.Expr, opts)
+	return step_invariant.NewStepInvariantOperator(next, e.Expr, opts)
 }
 
 func newDeduplication(ctx context.Context, e logicalplan.Deduplicate, scanners storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
@@ -369,14 +372,14 @@ func newDeduplication(ctx context.Context, e logicalplan.Deduplicate, scanners s
 		}
 		operators[i] = operator
 	}
-	coalesce := exchange.NewCoalesce(model.NewVectorPool(opts.StepsBatch), opts, 0, operators...)
-	dedup := exchange.NewDedupOperator(model.NewVectorPool(opts.StepsBatch), coalesce, opts)
+	coalesce := exchange.NewCoalesce(opts, 0, operators...)
+	dedup := exchange.NewDedupOperator(coalesce, opts)
 	return exchange.NewConcurrent(dedup, 2, opts), nil
 }
 
 func newRemoteExecution(ctx context.Context, e logicalplan.RemoteExecution, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
 	// Create a new remote query scoped to the calculated start time.
-	qry, err := e.Engine.NewRangeQuery(ctx, promql.NewPrometheusQueryOpts(false, opts.LookbackDelta), e.Query, e.QueryRangeStart, opts.End, opts.Step)
+	qry, err := e.Engine.NewRangeQuery(ctx, promql.NewPrometheusQueryOpts(false, opts.LookbackDelta), e.Query, e.QueryRangeStart, e.QueryRangeEnd, opts.Step)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +389,7 @@ func newRemoteExecution(ctx context.Context, e logicalplan.RemoteExecution, opts
 	// We need to set the lookback for the selector to 0 since the remote query already applies one lookback.
 	selectorOpts := *opts
 	selectorOpts.LookbackDelta = 0
-	remoteExec := remote.NewExecution(qry, model.NewVectorPool(opts.StepsBatch), e.QueryRangeStart, &selectorOpts, hints)
+	remoteExec := remote.NewExecution(qry, e.QueryRangeStart, e.QueryRangeEnd, e.Engine.LabelSets(), &selectorOpts, hints)
 	return exchange.NewConcurrent(remoteExec, 2, opts), nil
 }
 
@@ -407,9 +410,9 @@ func getTimeRangesForVectorSelector(n *logicalplan.VectorSelector, opts *query.O
 		end = *n.Timestamp
 	}
 	if evalRange == 0 {
-		start -= opts.LookbackDelta.Milliseconds()
+		start -= opts.LookbackDelta.Milliseconds() - 1
 	} else {
-		start -= evalRange
+		start -= evalRange - 1
 	}
 	offset := n.OriginalOffset.Milliseconds()
 	return start - offset, end - offset

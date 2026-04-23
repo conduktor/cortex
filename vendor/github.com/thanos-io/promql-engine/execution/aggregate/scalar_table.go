@@ -7,7 +7,11 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
+
+	"github.com/thanos-io/promql-engine/compute"
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/parse"
+	"github.com/thanos-io/promql-engine/warnings"
 
 	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -15,10 +19,6 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/util/annotations"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/parse"
-	"github.com/thanos-io/promql-engine/execution/warnings"
 )
 
 // aggregateTable is a table that aggregates input samples into
@@ -29,9 +29,8 @@ type aggregateTable interface {
 	timestamp() int64
 	// aggregate aggregates the given vector into the table.
 	aggregate(vector model.StepVector) error
-	// toVector writes out the accumulated result to the given vector and
-	// resets the table.
-	toVector(ctx context.Context, pool *model.VectorPool) model.StepVector
+	// populateVector writes out the accumulated result into the provided vector.
+	populateVector(ctx context.Context, vec *model.StepVector)
 	// reset resets the table with a new aggregation argument.
 	// The argument is currently used for quantile aggregation.
 	reset(arg float64)
@@ -41,12 +40,12 @@ type scalarTable struct {
 	ts           int64
 	inputs       []uint64
 	outputs      []*model.Series
-	accumulators []accumulator
+	accumulators []compute.Accumulator
 }
 
 func newScalarTables(stepsBatch int, inputCache []uint64, outputCache []*model.Series, aggregation parser.ItemType) ([]aggregateTable, error) {
 	tables := make([]aggregateTable, stepsBatch)
-	for i := 0; i < len(tables); i++ {
+	for i := range tables {
 		table, err := newScalarTable(inputCache, outputCache, aggregation)
 		if err != nil {
 			return nil, err
@@ -61,8 +60,8 @@ func (t *scalarTable) timestamp() int64 {
 }
 
 func newScalarTable(inputSampleIDs []uint64, outputs []*model.Series, aggregation parser.ItemType) (*scalarTable, error) {
-	accumulators := make([]accumulator, len(outputs))
-	for i := 0; i < len(accumulators); i++ {
+	accumulators := make([]compute.Accumulator, len(outputs))
+	for i := range accumulators {
 		acc, err := newScalarAccumulator(aggregation)
 		if err != nil {
 			return nil, err
@@ -80,17 +79,14 @@ func newScalarTable(inputSampleIDs []uint64, outputs []*model.Series, aggregatio
 func (t *scalarTable) aggregate(vector model.StepVector) error {
 	t.ts = vector.T
 
+	var err error
 	for i := range vector.Samples {
-		if err := t.addSample(vector.SampleIDs[i], vector.Samples[i]); err != nil {
-			return err
-		}
+		err = warnings.Coalesce(err, t.addSample(vector.SampleIDs[i], vector.Samples[i]))
 	}
 	for i := range vector.Histograms {
-		if err := t.addHistogram(vector.HistogramIDs[i], vector.Histograms[i]); err != nil {
-			return err
-		}
+		err = warnings.Coalesce(err, t.addHistogram(vector.HistogramIDs[i], vector.Histograms[i]))
 	}
-	return nil
+	return err
 }
 
 func (t *scalarTable) addSample(sampleID uint64, sample float64) error {
@@ -114,24 +110,44 @@ func (t *scalarTable) reset(arg float64) {
 	t.ts = math.MinInt64
 }
 
-func (t *scalarTable) toVector(ctx context.Context, pool *model.VectorPool) model.StepVector {
-	result := pool.GetStepVector(t.ts)
+func (t *scalarTable) populateVector(ctx context.Context, vec *model.StepVector) {
+	hint := len(t.outputs)
 	for i, v := range t.outputs {
-		switch t.accumulators[i].ValueType() {
-		case NoValue:
+		acc := t.accumulators[i]
+		emitAccumulatorWarnings(ctx, acc.Warnings())
+		switch acc.ValueType() {
+		case compute.NoValue, compute.MixedTypeValue:
+			// MixedTypeValue: warning already emitted by emitAccumulatorWarnings
+			// for accumulators that track mixed floats/histograms.
 			continue
-		case SingleTypeValue:
-			f, h := t.accumulators[i].Value()
+		case compute.SingleTypeValue:
+			f, h := acc.Value()
 			if h == nil {
-				result.AppendSample(pool, v.ID, f)
+				vec.AppendSampleWithSizeHint(v.ID, f, hint)
 			} else {
-				result.AppendHistogram(pool, v.ID, h)
+				vec.AppendHistogramWithSizeHint(v.ID, h, hint)
 			}
-		case MixedTypeValue:
-			warnings.AddToContext(annotations.NewMixedFloatsHistogramsAggWarning(posrange.PositionRange{}), ctx)
 		}
 	}
-	return result
+}
+
+// emitAccumulatorWarnings converts accumulator warning flags to annotations and adds them to context.
+func emitAccumulatorWarnings(ctx context.Context, warn warnings.Warnings) {
+	if warn == 0 {
+		return
+	}
+	if warn&warnings.WarnHistogramIgnoredInAggregation != 0 {
+		warnings.AddToContext(annotations.HistogramIgnoredInAggregationInfo, ctx)
+	}
+	if warn&warnings.WarnMixedFloatsHistograms != 0 {
+		warnings.AddToContext(warnings.MixedFloatsHistogramsAggWarning, ctx)
+	}
+	if warn&warnings.WarnCounterResetCollision != 0 {
+		warnings.AddToContext(annotations.NewHistogramCounterResetCollisionWarning(posrange.PositionRange{}, annotations.HistogramAgg), ctx)
+	}
+	if warn&warnings.WarnNHCBBoundsReconciledAgg != 0 {
+		warnings.AddToContext(annotations.NewMismatchedCustomBucketsHistogramsInfo(posrange.PositionRange{}, annotations.HistogramAgg), ctx)
+	}
 }
 
 func hashMetric(
@@ -173,52 +189,42 @@ func hashMetric(
 	return key, builder.Labels()
 }
 
-func newScalarAccumulator(expr parser.ItemType) (accumulator, error) {
+// doing it the prometheus way
+// https://github.com/prometheus/prometheus/blob/f379e2eac7134dea12ae1d93ebdcb8109db3a5ef/promql/engine.go#L3809C1-L3833C2
+// if ratioLimit > 0 and sampleOffset turns out to be < ratioLimit add sample to the result
+// else if ratioLimit < 0 then do ratioLimit+1(switch to positive axis), therefore now we will be taking those samples whose sampleOffset >= 1+ratioLimit (inverting the logic from previous case).
+func addRatioSample(ratioLimit float64, series labels.Labels) bool {
+	sampleOffset := float64(series.Hash()) / float64(math.MaxUint64)
+
+	return (ratioLimit >= 0 && sampleOffset < ratioLimit) ||
+		(ratioLimit < 0 && sampleOffset >= (1.0+ratioLimit))
+}
+
+func newScalarAccumulator(expr parser.ItemType) (compute.Accumulator, error) {
 	t := parser.ItemTypeStr[expr]
 	switch t {
 	case "sum":
-		return newSumAcc(), nil
+		return compute.NewSumAcc(), nil
 	case "max":
-		return newMaxAcc(), nil
+		return compute.NewMaxAcc(), nil
 	case "min":
-		return newMinAcc(), nil
+		return compute.NewMinAcc(), nil
 	case "count":
-		return newCountAcc(), nil
+		return compute.NewCountAcc(), nil
 	case "avg":
-		return newAvgAcc(), nil
+		return compute.NewAvgAcc(), nil
 	case "group":
-		return newGroupAcc(), nil
+		return compute.NewGroupAcc(), nil
 	case "stddev":
-		return newStdDevAcc(), nil
+		return compute.NewStdDevAcc(), nil
 	case "stdvar":
-		return newStdVarAcc(), nil
+		return compute.NewStdVarAcc(), nil
 	case "quantile":
-		return newQuantileAcc(), nil
+		return compute.NewQuantileAcc(), nil
+	case "histogram_avg":
+		return compute.NewHistogramAvgAcc(), nil
 	}
+
 	msg := fmt.Sprintf("unknown aggregation function %s", t)
 	return nil, errors.Wrap(parse.ErrNotSupportedExpr, msg)
-}
-
-func Quantile(q float64, points []float64) float64 {
-	if len(points) == 0 || math.IsNaN(q) {
-		return math.NaN()
-	}
-	if q < 0 {
-		return math.Inf(-1)
-	}
-	if q > 1 {
-		return math.Inf(+1)
-	}
-	sort.Float64s(points)
-
-	n := float64(len(points))
-	// When the quantile lies between two samples,
-	// we use a weighted average of the two samples.
-	rank := q * (n - 1)
-
-	lowerIndex := math.Max(0, math.Floor(rank))
-	upperIndex := math.Min(n-1, lowerIndex+1)
-
-	weight := rank - math.Floor(rank)
-	return points[int(lowerIndex)]*(1-weight) + points[int(upperIndex)]*weight
 }

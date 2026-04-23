@@ -12,17 +12,18 @@ import (
 )
 
 var (
-	errMaxSeriesPerMetricLimitExceeded   = errors.New("per-metric series limit exceeded")
-	errMaxMetadataPerMetricLimitExceeded = errors.New("per-metric metadata limit exceeded")
-	errMaxSeriesPerUserLimitExceeded     = errors.New("per-user series limit exceeded")
-	errMaxMetadataPerUserLimitExceeded   = errors.New("per-user metric metadata limit exceeded")
+	errMaxSeriesPerMetricLimitExceeded              = errors.New("per-metric series limit exceeded")
+	errMaxMetadataPerMetricLimitExceeded            = errors.New("per-metric metadata limit exceeded")
+	errMaxSeriesPerUserLimitExceeded                = errors.New("per-user series limit exceeded")
+	errMaxNativeHistogramSeriesPerUserLimitExceeded = errors.New("per-user native histogram series limit exceeded")
+	errMaxMetadataPerUserLimitExceeded              = errors.New("per-user metric metadata limit exceeded")
 )
 
 type errMaxSeriesPerLabelSetLimitExceeded struct {
 	error
-	id          string
-	localLimit  int
-	globalLimit int
+	id               string
+	actualLocalLimit int
+	globalLimit      int
 }
 
 // RingCount is the interface exposed by a ring implementation which allows
@@ -95,6 +96,16 @@ func (l *Limiter) AssertMaxSeriesPerUser(userID string, series int) error {
 	return errMaxSeriesPerUserLimitExceeded
 }
 
+// AssertMaxNativeHistogramSeriesPerUser limit has not been reached compared to the current
+// number of native histogram series in input and returns an error if so.
+func (l *Limiter) AssertMaxNativeHistogramSeriesPerUser(userID string, series int) error {
+	if actualLimit := l.maxNativeHistogramSeriesPerUser(userID); series < actualLimit {
+		return nil
+	}
+
+	return errMaxNativeHistogramSeriesPerUserLimitExceeded
+}
+
 // AssertMaxMetricsWithMetadataPerUser limit has not been reached compared to the current
 // number of metrics with metadata in input and returns an error if so.
 func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int) error {
@@ -107,20 +118,21 @@ func (l *Limiter) AssertMaxMetricsWithMetadataPerUser(userID string, metrics int
 
 // AssertMaxSeriesPerLabelSet limit has not been reached compared to the current
 // number of metrics with metadata in input and returns an error if so.
-func (l *Limiter) AssertMaxSeriesPerLabelSet(userID string, metric labels.Labels, f func(validation.LimitsPerLabelSet) (int, error)) error {
-	m := l.limitsPerLabelSets(userID, metric)
-	for _, limit := range m {
+func (l *Limiter) AssertMaxSeriesPerLabelSet(userID string, metric labels.Labels, f func(allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error)) error {
+	limits := l.limits.LimitsPerLabelSet(userID)
+	matchedLimits := validation.LimitsPerLabelSetsForSeries(limits, metric)
+	for _, limit := range matchedLimits {
 		maxSeriesFunc := func(string) int {
 			return limit.Limits.MaxSeries
 		}
 		local := l.maxByLocalAndGlobal(userID, maxSeriesFunc, maxSeriesFunc)
-		if u, err := f(limit); err != nil {
+		if u, err := f(limits, limit); err != nil {
 			return err
 		} else if u >= local {
 			return errMaxSeriesPerLabelSetLimitExceeded{
-				id:          limit.Id,
-				localLimit:  local,
-				globalLimit: limit.Limits.MaxSeries,
+				id:               limit.Id,
+				actualLocalLimit: local,
+				globalLimit:      limit.Limits.MaxSeries,
 			}
 		}
 	}
@@ -129,16 +141,18 @@ func (l *Limiter) AssertMaxSeriesPerLabelSet(userID string, metric labels.Labels
 
 // FormatError returns the input error enriched with the actual limits for the given user.
 // It acts as pass-through if the input error is unknown.
-func (l *Limiter) FormatError(userID string, err error) error {
+func (l *Limiter) FormatError(userID string, err error, lbls labels.Labels) error {
 	switch {
 	case errors.Is(err, errMaxSeriesPerUserLimitExceeded):
 		return l.formatMaxSeriesPerUserError(userID)
+	case errors.Is(err, errMaxNativeHistogramSeriesPerUserLimitExceeded):
+		return l.formatMaxNativeHistogramsSeriesPerUserError(userID)
 	case errors.Is(err, errMaxSeriesPerMetricLimitExceeded):
-		return l.formatMaxSeriesPerMetricError(userID)
+		return l.formatMaxSeriesPerMetricError(userID, lbls.Get(labels.MetricName))
 	case errors.Is(err, errMaxMetadataPerUserLimitExceeded):
 		return l.formatMaxMetadataPerUserError(userID)
 	case errors.Is(err, errMaxMetadataPerMetricLimitExceeded):
-		return l.formatMaxMetadataPerMetricError(userID)
+		return l.formatMaxMetadataPerMetricError(userID, lbls.Get(labels.MetricName))
 	case errors.As(err, &errMaxSeriesPerLabelSetLimitExceeded{}):
 		e := errMaxSeriesPerLabelSetLimitExceeded{}
 		errors.As(err, &e)
@@ -157,13 +171,22 @@ func (l *Limiter) formatMaxSeriesPerUserError(userID string) error {
 		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
-func (l *Limiter) formatMaxSeriesPerMetricError(userID string) error {
+func (l *Limiter) formatMaxNativeHistogramsSeriesPerUserError(userID string) error {
+	actualLimit := l.maxNativeHistogramSeriesPerUser(userID)
+	localLimit := l.limits.MaxLocalNativeHistogramSeriesPerUser(userID)
+	globalLimit := l.limits.MaxGlobalNativeHistogramSeriesPerUser(userID)
+
+	return fmt.Errorf("per-user native histogram series limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
+}
+
+func (l *Limiter) formatMaxSeriesPerMetricError(userID string, metric string) error {
 	actualLimit := l.maxSeriesPerMetric(userID)
 	localLimit := l.limits.MaxLocalSeriesPerMetric(userID)
 	globalLimit := l.limits.MaxGlobalSeriesPerMetric(userID)
 
-	return fmt.Errorf("per-metric series limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-metric series limit of %d exceeded for metric %s, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), metric, l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
 func (l *Limiter) formatMaxMetadataPerUserError(userID string) error {
@@ -175,40 +198,23 @@ func (l *Limiter) formatMaxMetadataPerUserError(userID string) error {
 		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
-func (l *Limiter) formatMaxMetadataPerMetricError(userID string) error {
+func (l *Limiter) formatMaxMetadataPerMetricError(userID string, metric string) error {
 	actualLimit := l.maxMetadataPerMetric(userID)
 	localLimit := l.limits.MaxLocalMetadataPerMetric(userID)
 	globalLimit := l.limits.MaxGlobalMetadataPerMetric(userID)
 
-	return fmt.Errorf("per-metric metadata limit of %d exceeded, %s (local limit: %d global limit: %d actual local limit: %d)",
-		minNonZero(localLimit, globalLimit), l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
+	return fmt.Errorf("per-metric metadata limit of %d exceeded for metric %s, %s (local limit: %d global limit: %d actual local limit: %d)",
+		minNonZero(localLimit, globalLimit), metric, l.AdminLimitMessage, localLimit, globalLimit, actualLimit)
 }
 
 func (l *Limiter) formatMaxSeriesPerLabelSetError(err errMaxSeriesPerLabelSetLimitExceeded) error {
-	return fmt.Errorf("per-labelset series limit of %d exceeded (labelSet: %s, local limit: %d global limit: %d actual)",
-		minNonZero(err.globalLimit, err.localLimit), err.id, err.localLimit, err.globalLimit)
+	return fmt.Errorf("per-labelset series limit of %d exceeded (labelSet: %s, global limit: %d actual local limit: %d)",
+		minNonZero(err.globalLimit, err.actualLocalLimit), err.id, err.globalLimit, err.actualLocalLimit)
 }
 
 func (l *Limiter) limitsPerLabelSets(userID string, metric labels.Labels) []validation.LimitsPerLabelSet {
 	m := l.limits.LimitsPerLabelSet(userID)
-
-	// returning early to not have any overhead
-	if len(m) == 0 {
-		return nil
-	}
-
-	r := make([]validation.LimitsPerLabelSet, 0, len(m))
-outer:
-	for _, lbls := range m {
-		for _, lbl := range lbls.LabelSet {
-			// We did not find some of the labels on  the set
-			if v := metric.Get(lbl.Name); v != lbl.Value {
-				continue outer
-			}
-		}
-		r = append(r, lbls)
-	}
-	return r
+	return validation.LimitsPerLabelSetsForSeries(m, metric)
 }
 
 func (l *Limiter) maxSeriesPerMetric(userID string) int {
@@ -261,6 +267,14 @@ func (l *Limiter) maxSeriesPerUser(userID string) int {
 		userID,
 		l.limits.MaxLocalSeriesPerUser,
 		l.limits.MaxGlobalSeriesPerUser,
+	)
+}
+
+func (l *Limiter) maxNativeHistogramSeriesPerUser(userID string) int {
+	return l.maxByLocalAndGlobal(
+		userID,
+		l.limits.MaxLocalNativeHistogramSeriesPerUser,
+		l.limits.MaxGlobalNativeHistogramSeriesPerUser,
 	)
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 type mockRuleStore struct {
@@ -19,7 +20,7 @@ type mockRuleStore struct {
 
 var (
 	delim               = "/"
-	interval, _         = time.ParseDuration("1m")
+	interval, _         = time.ParseDuration("10s")
 	mockRulesNamespaces = map[string]rulespb.RuleGroupList{
 		"user1": {
 			&rulespb.RuleGroupDesc{
@@ -330,6 +331,10 @@ func (m *mockRuleStore) DeleteRuleGroup(ctx context.Context, userID string, name
 		}
 	}
 
+	return nil
+}
+
+func (m *mockRuleStore) GetUserIndexUpdater() *users.UserIndexUpdater {
 	return nil
 }
 

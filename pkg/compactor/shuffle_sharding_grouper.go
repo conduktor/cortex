@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
@@ -19,6 +19,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact"
 
 	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 type ShuffleShardingGrouper struct {
@@ -279,7 +280,8 @@ func (g *ShuffleShardingGrouper) isGroupVisited(blocks []*metadata.Meta, compact
 
 // Check whether this compactor exists on the subring based on user ID
 func (g *ShuffleShardingGrouper) checkSubringForCompactor() (bool, error) {
-	subRing := g.ring.ShuffleShard(g.userID, g.limits.CompactorTenantShardSize(g.userID))
+	shardSize := util.DynamicShardSize(g.limits.CompactorTenantShardSize(g.userID), g.ring.InstancesCount())
+	subRing := g.ring.ShuffleShard(g.userID, shardSize)
 
 	rs, err := subRing.GetAllHealthy(RingOp)
 	if err != nil {
@@ -289,15 +291,20 @@ func (g *ShuffleShardingGrouper) checkSubringForCompactor() (bool, error) {
 	return rs.Includes(g.ringLifecyclerAddr), nil
 }
 
-// Get the hash of a group based on the UserID, and the starting and ending time of the group's range.
+// hashGroup Get the hash of a group based on the UserID, and the starting and ending time of the group's range.
 func hashGroup(userID string, rangeStart int64, rangeEnd int64) uint32 {
 	groupString := fmt.Sprintf("%v%v%v", userID, rangeStart, rangeEnd)
-	groupHasher := fnv.New32a()
-	// Hasher never returns err.
-	_, _ = groupHasher.Write([]byte(groupString))
-	groupHash := groupHasher.Sum32()
 
-	return groupHash
+	return hashString(groupString)
+}
+
+func hashString(s string) uint32 {
+	hasher := fnv.New32a()
+	// Hasher never returns err.
+	_, _ = hasher.Write([]byte(s))
+	result := hasher.Sum32()
+
+	return result
 }
 
 func createGroupKey(groupHash uint32, group blocksGroup) string {
@@ -331,7 +338,7 @@ func (g blocksGroup) rangeEndTime() time.Time {
 
 func (g blocksGroup) String() string {
 	out := strings.Builder{}
-	out.WriteString(fmt.Sprintf("Group range start: %d, range end: %d, key %v, blocks: ", g.rangeStart, g.rangeEnd, g.key))
+	fmt.Fprintf(&out, "Group range start: %d, range end: %d, key %v, blocks: ", g.rangeStart, g.rangeEnd, g.key)
 
 	for i, b := range g.blocks {
 		if i > 0 {
@@ -340,7 +347,7 @@ func (g blocksGroup) String() string {
 
 		minT := time.Unix(0, b.MinTime*int64(time.Millisecond)).UTC()
 		maxT := time.Unix(0, b.MaxTime*int64(time.Millisecond)).UTC()
-		out.WriteString(fmt.Sprintf("%s (min time: %s, max time: %s)", b.ULID.String(), minT.String(), maxT.String()))
+		fmt.Fprintf(&out, "%s (min time: %s, max time: %s)", b.ULID.String(), minT.String(), maxT.String())
 	}
 
 	return out.String()
@@ -501,6 +508,6 @@ func getRangeStart(m *metadata.Meta, tr int64) int64 {
 
 func sortMetasByMinTime(metas []*metadata.Meta) {
 	sort.Slice(metas, func(i, j int) bool {
-		return metas[i].BlockMeta.MinTime < metas[j].BlockMeta.MinTime
+		return metas[i].MinTime < metas[j].MinTime
 	})
 }

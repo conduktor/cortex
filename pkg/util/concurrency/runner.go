@@ -29,10 +29,9 @@ func ForEachUser(ctx context.Context, userIDs []string, concurrency int, userFun
 	errsMx := sync.Mutex{}
 
 	wg := sync.WaitGroup{}
-	for ix := 0; ix < min(concurrency, len(userIDs)); ix++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	routines := min(concurrency, len(userIDs))
+	for range routines {
+		wg.Go(func() {
 
 			for userID := range ch {
 				// Ensure the context has not been canceled (ie. shutdown has been triggered).
@@ -46,7 +45,7 @@ func ForEachUser(ctx context.Context, userIDs []string, concurrency int, userFun
 					errsMx.Unlock()
 				}
 			}
-		}()
+		})
 	}
 
 	// wait for ongoing workers to finish.
@@ -61,13 +60,13 @@ func ForEachUser(ctx context.Context, userIDs []string, concurrency int, userFun
 
 // ForEach runs the provided jobFunc for each job up to concurrency concurrent workers.
 // The execution breaks on first error encountered.
-func ForEach(ctx context.Context, jobs []interface{}, concurrency int, jobFunc func(ctx context.Context, job interface{}) error) error {
+func ForEach(ctx context.Context, jobs []any, concurrency int, jobFunc func(ctx context.Context, job any) error) error {
 	if len(jobs) == 0 {
 		return nil
 	}
 
 	// Push all jobs to a channel.
-	ch := make(chan interface{}, len(jobs))
+	ch := make(chan any, len(jobs))
 	for _, job := range jobs {
 		ch <- job
 	}
@@ -75,7 +74,8 @@ func ForEach(ctx context.Context, jobs []interface{}, concurrency int, jobFunc f
 
 	// Start workers to process jobs.
 	g, ctx := errgroup.WithContext(ctx)
-	for ix := 0; ix < min(concurrency, len(jobs)); ix++ {
+	routines := min(concurrency, len(jobs))
+	for range routines {
 		g.Go(func() error {
 			for job := range ch {
 				if err := ctx.Err(); err != nil {
@@ -96,9 +96,9 @@ func ForEach(ctx context.Context, jobs []interface{}, concurrency int, jobFunc f
 }
 
 // CreateJobsFromStrings is a utility to create jobs from an slice of strings.
-func CreateJobsFromStrings(values []string) []interface{} {
-	jobs := make([]interface{}, len(values))
-	for i := 0; i < len(values); i++ {
+func CreateJobsFromStrings(values []string) []any {
+	jobs := make([]any, len(values))
+	for i := range values {
 		jobs[i] = values[i]
 	}
 	return jobs

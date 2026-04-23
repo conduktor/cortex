@@ -7,8 +7,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cortexproject/cortex/pkg/distributor"
+	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
+
+func TestLoadRuntimeConfig_ShouldNoPanicWhenNull(t *testing.T) {
+	yamlFile := strings.NewReader(`
+null
+`)
+
+	loader := runtimeConfigLoader{cfg: Config{Target: []string{All}}}
+	_, err := loader.load(yamlFile)
+	require.NoError(t, err)
+}
 
 // Given limits are usually loaded via a config file, and that
 // a configmap is limited to 1MB, we need to minimise the limits file.
@@ -28,7 +40,8 @@ overrides:
   '1235': *id001
   '1236': *id001
 `)
-	runtimeCfg, err := loadRuntimeConfig(yamlFile)
+	loader := runtimeConfigLoader{cfg: Config{Distributor: distributor.Config{ShardByAllLabels: true}}}
+	runtimeCfg, err := loader.load(yamlFile)
 	require.NoError(t, err)
 
 	limits := validation.Limits{
@@ -51,7 +64,7 @@ func TestLoadRuntimeConfig_ShouldLoadEmptyFile(t *testing.T) {
 	yamlFile := strings.NewReader(`
 # This is an empty YAML.
 `)
-	actual, err := loadRuntimeConfig(yamlFile)
+	actual, err := runtimeConfigLoader{}.load(yamlFile)
 	require.NoError(t, err)
 	assert.Equal(t, &RuntimeConfigValues{}, actual)
 }
@@ -60,7 +73,7 @@ func TestLoadRuntimeConfig_MissingPointerFieldsAreNil(t *testing.T) {
 	yamlFile := strings.NewReader(`
 # This is an empty YAML.
 `)
-	actual, err := loadRuntimeConfig(yamlFile)
+	actual, err := runtimeConfigLoader{}.load(yamlFile)
 	require.NoError(t, err)
 
 	actualCfg, ok := actual.(*RuntimeConfigValues)
@@ -102,8 +115,111 @@ overrides:
 	}
 
 	for _, tc := range cases {
-		actual, err := loadRuntimeConfig(strings.NewReader(tc))
+		actual, err := runtimeConfigLoader{}.load(strings.NewReader(tc))
 		assert.Equal(t, errMultipleDocuments, err)
 		assert.Nil(t, actual)
+	}
+}
+
+func TestLoad_ShouldNotErrorWithCertainTarget(t *testing.T) {
+
+	tests := []struct {
+		desc             string
+		target           []string
+		shardByAllLabels bool
+		isErr            bool
+	}{
+		{
+			desc:             "all",
+			target:           []string{All},
+			shardByAllLabels: true,
+		},
+		{
+			desc:             "all, shardByAllLabels:false",
+			target:           []string{All},
+			shardByAllLabels: false,
+			isErr:            true,
+		},
+		{
+			desc:             "distributor",
+			target:           []string{Distributor},
+			shardByAllLabels: true,
+		},
+		{
+			desc:             "distributor, shardByAllLabels:false",
+			target:           []string{Distributor},
+			shardByAllLabels: false,
+			isErr:            true,
+		},
+		{
+			desc:             "querier",
+			target:           []string{Querier},
+			shardByAllLabels: true,
+		},
+		{
+			desc:             "querier, shardByAllLabels:false",
+			target:           []string{Querier},
+			shardByAllLabels: false,
+			isErr:            true,
+		},
+		{
+			desc:             "ruler",
+			target:           []string{Ruler},
+			shardByAllLabels: true,
+		},
+		{
+			desc:             "ruler, shardByAllLabels:false",
+			target:           []string{Ruler},
+			shardByAllLabels: false,
+			isErr:            true,
+		},
+		{
+			desc:   "ingester",
+			target: []string{Ingester},
+		},
+		{
+			desc:   "query frontend",
+			target: []string{QueryFrontend},
+		},
+		{
+			desc:   "alertmanager",
+			target: []string{AlertManager},
+		},
+		{
+			desc:   "store gateway",
+			target: []string{StoreGateway},
+		},
+		{
+			desc:   "compactor",
+			target: []string{Compactor},
+		},
+		{
+			desc:   "overrides exporter",
+			target: []string{OverridesExporter},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			yamlFile := strings.NewReader(`
+overrides:
+  'user-1':
+    max_global_series_per_user: 15000
+`)
+
+			loader := runtimeConfigLoader{}
+			loader.cfg = Config{
+				Target:      tc.target,
+				Distributor: distributor.Config{ShardByAllLabels: tc.shardByAllLabels},
+				Ingester:    ingester.Config{ActiveSeriesMetricsEnabled: true},
+			}
+
+			_, err := loader.load(yamlFile)
+			if tc.isErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
 }

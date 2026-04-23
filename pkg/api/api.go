@@ -12,6 +12,9 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/grafana/regexp"
 	"github.com/klauspost/compress/gzhttp"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/httputil"
@@ -29,6 +32,7 @@ import (
 	frontendv2 "github.com/cortexproject/cortex/pkg/frontend/v2"
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
+	"github.com/cortexproject/cortex/pkg/overrides"
 	"github.com/cortexproject/cortex/pkg/purger"
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/ring"
@@ -39,11 +43,12 @@ import (
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/push"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 // DistributorPushWrapper wraps around a push. It is similar to middleware.Interface.
 type DistributorPushWrapper func(next push.Func) push.Func
-type ConfigHandler func(actualCfg interface{}, defaultCfg interface{}) http.HandlerFunc
+type ConfigHandler func(actualCfg any, defaultCfg any) http.HandlerFunc
 
 type Config struct {
 	ResponseCompression bool `yaml:"response_compression_enabled"`
@@ -69,17 +74,29 @@ type Config struct {
 	// Allows and is used to configure the addition of HTTP Header fields to logs
 	HTTPRequestHeadersToLog flagext.StringSlice `yaml:"http_request_headers_to_log"`
 
+	// HTTP header that can be used as request id. It will always be included in logs
+	// If it's not provided, or this header is empty, then random requestId will be generated
+	RequestIdHeader string `yaml:"request_id_header"`
+
 	// This sets the Origin header value
 	corsRegexString string `yaml:"cors_origin"`
 
 	buildInfoEnabled bool `yaml:"build_info_enabled"`
+
+	QuerierDefaultCodec string `yaml:"querier_default_codec"`
 }
+
+var (
+	errUnsupportedDefaultCodec = errors.New("unsupported default codec type. Supported types are 'json' and 'protobuf'")
+)
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ResponseCompression, "api.response-compression-enabled", false, "Use GZIP compression for API responses. Some endpoints serve large YAML or JSON blobs which can benefit from compression.")
 	f.Var(&cfg.HTTPRequestHeadersToLog, "api.http-request-headers-to-log", "Which HTTP Request headers to add to logs")
+	f.StringVar(&cfg.RequestIdHeader, "api.request-id-header", "", "HTTP header that can be used as request id")
 	f.BoolVar(&cfg.buildInfoEnabled, "api.build-info-enabled", false, "If enabled, build Info API will be served by query frontend or querier.")
+	f.StringVar(&cfg.QuerierDefaultCodec, "api.querier-default-codec", "json", "Choose default codec for querier response serialization. Supports 'json' and 'protobuf'.")
 	cfg.RegisterFlagsWithPrefix("", f)
 }
 
@@ -88,6 +105,14 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.AlertmanagerHTTPPrefix, prefix+"http.alertmanager-http-prefix", "/alertmanager", "HTTP URL path under which the Alertmanager ui and api will be served.")
 	f.StringVar(&cfg.PrometheusHTTPPrefix, prefix+"http.prometheus-http-prefix", "/prometheus", "HTTP URL path under which the Prometheus api will be served.")
 	f.StringVar(&cfg.corsRegexString, prefix+"server.cors-origin", ".*", `Regex for CORS origin. It is fully anchored. Example: 'https?://(domain1|domain2)\.com'`)
+}
+
+// validate config
+func (cfg *Config) Validate() error {
+	if cfg.QuerierDefaultCodec != "json" && cfg.QuerierDefaultCodec != "protobuf" {
+		return errUnsupportedDefaultCodec
+	}
+	return nil
 }
 
 // Push either wraps the distributor push function as configured or returns the distributor push directly.
@@ -152,8 +177,9 @@ func New(cfg Config, serverCfg server.Config, s *server.Server, logger log.Logge
 	if cfg.HTTPAuthMiddleware == nil {
 		api.AuthMiddleware = middleware.AuthenticateUser
 	}
-	if len(cfg.HTTPRequestHeadersToLog) > 0 {
-		api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{TargetHeaders: cfg.HTTPRequestHeadersToLog}
+	api.HTTPHeaderMiddleware = &HTTPHeaderMiddleware{
+		TargetHeaders:   cfg.HTTPRequestHeadersToLog,
+		RequestIdHeader: cfg.RequestIdHeader,
 	}
 
 	return api, nil
@@ -239,7 +265,7 @@ func (a *API) RegisterAlertmanager(am *alertmanager.MultitenantAlertmanager, tar
 }
 
 // RegisterAPI registers the standard endpoints associated with a running Cortex.
-func (a *API) RegisterAPI(httpPathPrefix string, actualCfg interface{}, defaultCfg interface{}) {
+func (a *API) RegisterAPI(httpPathPrefix string, actualCfg any, defaultCfg any) {
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config", "Current Config (including the default values)")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/config?mode=diff", "Current Config (show only values that differ from the defaults)")
 
@@ -257,11 +283,17 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc) {
 }
 
 // RegisterDistributor registers the endpoints associated with the distributor.
-func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distributor.Config) {
+func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distributor.Config, overrides *validation.Overrides, reg prometheus.Registerer) {
 	distributorpb.RegisterDistributorServer(a.server.GRPC, d)
 
-	a.RegisterRoute("/api/v1/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
-	a.RegisterRoute("/api/v1/otlp/v1/metrics", push.OTLPHandler(a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
+	requestTotal := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_push_requests_total",
+		Help:      "Total number of push requests by type.",
+	}, []string{"type"})
+
+	a.RegisterRoute("/api/v1/push", push.Handler(pushConfig.RemoteWriteV2Enabled, pushConfig.AcceptUnknownRemoteWriteContentType, pushConfig.MaxRecvMsgSize, overrides, a.sourceIPs, a.cfg.wrapDistributorPush(d), requestTotal), true, "POST")
+	a.RegisterRoute("/api/v1/otlp/v1/metrics", push.OTLPHandler(pushConfig.OTLPMaxRecvMsgSize, overrides, pushConfig.OTLPConfig, a.sourceIPs, a.cfg.wrapDistributorPush(d), requestTotal), true, "POST")
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/ring", "Distributor Ring Status")
 	a.indexPage.AddLink(SectionAdminEndpoints, "/distributor/all_user_stats", "Usage Statistics")
@@ -272,7 +304,7 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	a.RegisterRoute("/distributor/ha_tracker", d.HATracker, false, "GET")
 
 	// Legacy Routes
-	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, a.cfg.wrapDistributorPush(d)), true, "POST")
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/push"), push.Handler(pushConfig.RemoteWriteV2Enabled, pushConfig.AcceptUnknownRemoteWriteContentType, pushConfig.MaxRecvMsgSize, overrides, a.sourceIPs, a.cfg.wrapDistributorPush(d), requestTotal), true, "POST")
 	a.RegisterRoute("/all_user_stats", http.HandlerFunc(d.AllUserStatsHandler), false, "GET")
 	a.RegisterRoute("/ha-tracker", d.HATracker, false, "GET")
 }
@@ -290,7 +322,7 @@ type Ingester interface {
 }
 
 // RegisterIngester registers the ingesters HTTP and GRPC service
-func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
+func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config, overrides *validation.Overrides) {
 	client.RegisterIngesterServer(a.server.GRPC, i)
 
 	a.indexPage.AddLink(SectionAdminEndpoints, "/ingester/all_user_stats", "Usage Statistics")
@@ -305,12 +337,12 @@ func (a *API) RegisterIngester(i Ingester, pushConfig distributor.Config) {
 	a.RegisterRoute("/ingester/renewTokens", http.HandlerFunc(i.RenewTokenHandler), false, "GET", "POST")
 	a.RegisterRoute("/ingester/all_user_stats", http.HandlerFunc(i.AllUserStatsHandler), false, "GET")
 	a.RegisterRoute("/ingester/mode", http.HandlerFunc(i.ModeHandler), false, "GET", "POST")
-	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	a.RegisterRoute("/ingester/push", push.Handler(pushConfig.RemoteWriteV2Enabled, pushConfig.AcceptUnknownRemoteWriteContentType, pushConfig.MaxRecvMsgSize, overrides, a.sourceIPs, i.Push, nil), true, "POST") // For testing and debugging.
 
 	// Legacy Routes
 	a.RegisterRoute("/flush", http.HandlerFunc(i.FlushHandler), false, "GET", "POST")
 	a.RegisterRoute("/shutdown", http.HandlerFunc(i.ShutdownHandler), false, "GET", "POST")
-	a.RegisterRoute("/push", push.Handler(pushConfig.MaxRecvMsgSize, a.sourceIPs, i.Push), true, "POST") // For testing and debugging.
+	a.RegisterRoute("/push", push.Handler(pushConfig.RemoteWriteV2Enabled, pushConfig.AcceptUnknownRemoteWriteContentType, pushConfig.MaxRecvMsgSize, overrides, a.sourceIPs, i.Push, nil), true, "POST") // For testing and debugging.
 }
 
 func (a *API) RegisterTenantDeletion(api *purger.TenantDeletionAPI) {
@@ -360,6 +392,14 @@ func (a *API) RegisterRulerAPI(r *ruler.API) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.CreateRuleGroup), true, "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}/{groupName}"), http.HandlerFunc(r.DeleteRuleGroup), true, "DELETE")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/rules/{namespace}"), http.HandlerFunc(r.DeleteNamespace), true, "DELETE")
+}
+
+// RegisterOverrides registers routes associated with the Overrides API
+func (a *API) RegisterOverrides(o *overrides.API) {
+	// Register individual overrides API routes with the main API
+	a.RegisterRoute("/api/v1/user-overrides", http.HandlerFunc(o.GetOverrides), true, "GET")
+	a.RegisterRoute("/api/v1/user-overrides", http.HandlerFunc(o.SetOverrides), true, "POST")
+	a.RegisterRoute("/api/v1/user-overrides", http.HandlerFunc(o.DeleteOverrides), true, "DELETE")
 }
 
 // RegisterRing registers the ring UI page associated with the distributor for writes.
@@ -413,6 +453,8 @@ func (a *API) RegisterQueryAPI(handler http.Handler) {
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/query"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/query_range"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/query_exemplars"), hf, true, "GET", "POST")
+	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/format_query"), hf, true, "GET", "POST")
+	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/parse_query"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/labels"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/label/{name}/values"), hf, true, "GET")
 	a.RegisterRoute(path.Join(a.cfg.PrometheusHTTPPrefix, "/api/v1/series"), hf, true, "GET", "POST", "DELETE")
@@ -423,6 +465,8 @@ func (a *API) RegisterQueryAPI(handler http.Handler) {
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/query"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/query_range"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/query_exemplars"), hf, true, "GET", "POST")
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/format_query"), hf, true, "GET", "POST")
+	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/parse_query"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/labels"), hf, true, "GET", "POST")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/label/{name}/values"), hf, true, "GET")
 	a.RegisterRoute(path.Join(a.cfg.LegacyHTTPPrefix, "/api/v1/series"), hf, true, "GET", "POST", "DELETE")

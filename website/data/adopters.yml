@@ -9,6 +9,9 @@ adopters:
   - name: Buoyant
     url: https://buoyant.io/
     logo: buoyant.svg
+  - name: Cabify
+    url: https://tech.cabify.com/
+    logo: cabify.svg
   - name: DigitalOcean
     url: https://www.digitalocean.com/
     logo: digital_ocean.png
@@ -24,6 +27,9 @@ adopters:
   - name: GoJek
     url: https://www.gojek.io/
     logo: gojek.png
+  - name: KakaoEnterprise
+    url: https://kakaocloud.com/
+    logo: kakaocloud.svg
   - name: MayaData
     url: https://mayadata.io/
     logo: mayadata.svg

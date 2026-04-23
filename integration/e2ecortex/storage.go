@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/thanos-io/objstore"
 
 	"github.com/cortexproject/cortex/integration/e2e"
@@ -21,7 +21,7 @@ type S3Client struct {
 }
 
 func NewS3Client(cfg s3.Config) (*S3Client, error) {
-	writer, err := s3.NewBucketClient(cfg, "test", log.NewNopLogger())
+	writer, err := s3.NewBucketClient(cfg, nil, "test", log.NewNopLogger())
 	if err != nil {
 		return nil, err
 	}

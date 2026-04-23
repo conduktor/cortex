@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -17,10 +17,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
-
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestLoader_GetIndex_ShouldLazyLoadBucketIndex(t *testing.T) {
@@ -64,7 +63,7 @@ func TestLoader_GetIndex_ShouldLazyLoadBucketIndex(t *testing.T) {
 	))
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 		require.NoError(t, err)
 		assert.Equal(t, idx, actualIdx)
@@ -104,7 +103,7 @@ func TestLoader_GetIndex_ShouldCacheError(t *testing.T) {
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", IndexCompressedFilename), strings.NewReader("invalid!}")))
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		require.Equal(t, ErrIndexCorrupted, err)
 	}
@@ -140,7 +139,7 @@ func TestLoader_GetIndex_ShouldCacheIndexNotFoundError(t *testing.T) {
 	})
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		require.Equal(t, ErrIndexNotFound, err)
 	}
@@ -242,7 +241,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadSuccess(t *testing.T)
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, 2, func() interface{} {
+	test.Poll(t, 3*time.Second, 2, func() any {
 		actualIdx, _, err := loader.GetIndex(ctx, "user-1")
 		if err != nil {
 			return 0
@@ -305,7 +304,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousLoadFailure(t *testing.T)
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
+	test.Poll(t, 3*time.Second, nil, func() any {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		return err
 	})
@@ -358,7 +357,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousIndexNotFound(t *testing.
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
+	test.Poll(t, 3*time.Second, nil, func() any {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		return err
 	})
@@ -415,7 +414,7 @@ func TestLoader_ShouldNotCacheCriticalErrorOnBackgroundUpdates(t *testing.T) {
 	require.NoError(t, bkt.Upload(ctx, path.Join("user-1", IndexCompressedFilename), strings.NewReader("invalid!}")))
 
 	// Wait until the first failure has been tracked.
-	test.Poll(t, 3*time.Second, true, func() interface{} {
+	test.Poll(t, 3*time.Second, true, func() any {
 		return testutil.ToFloat64(loader.loadFailures) > 0
 	})
 
@@ -472,18 +471,21 @@ func TestLoader_ShouldCacheIndexNotFoundOnBackgroundUpdates(t *testing.T) {
 
 	// Wait until the next index load attempt occurs.
 	prevLoads := testutil.ToFloat64(loader.loadAttempts)
-	test.Poll(t, 3*time.Second, true, func() interface{} {
+	test.Poll(t, 3*time.Second, true, func() any {
 		return testutil.ToFloat64(loader.loadAttempts) > prevLoads
 	})
 
+	// Wait until the index is offloaded (metrics becomes 0).
 	// We expect the bucket index is not considered loaded because of the error.
-	assert.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+	test.Poll(t, 3*time.Second, true, func() any {
+		err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
 			# HELP cortex_bucket_index_loaded Number of bucket indexes currently loaded in-memory.
 			# TYPE cortex_bucket_index_loaded gauge
 			cortex_bucket_index_loaded 0
-		`),
-		"cortex_bucket_index_loaded",
-	))
+		`), "cortex_bucket_index_loaded")
+
+		return err == nil
+	})
 
 	// Try to get the index again. We expect no load attempt because the error has been cached.
 	prevLoads = testutil.ToFloat64(loader.loadAttempts)
@@ -531,7 +533,7 @@ func TestLoader_ShouldOffloadIndexIfNotFoundDuringBackgroundUpdates(t *testing.T
 	require.NoError(t, DeleteIndex(ctx, bkt, "user-1", nil))
 
 	// Wait until the index is offloaded.
-	test.Poll(t, 3*time.Second, float64(0), func() interface{} {
+	test.Poll(t, 3*time.Second, float64(0), func() any {
 		return testutil.ToFloat64(loader.loaded)
 	})
 
@@ -583,7 +585,7 @@ func TestLoader_ShouldOffloadIndexIfIdleTimeoutIsReachedDuringBackgroundUpdates(
 	assert.Equal(t, idx, actualIdx)
 
 	// Wait until the index is offloaded.
-	test.Poll(t, 3*time.Second, float64(0), func() interface{} {
+	test.Poll(t, 3*time.Second, float64(0), func() any {
 		return testutil.ToFloat64(loader.loaded)
 	})
 
@@ -679,7 +681,7 @@ func TestLoader_ShouldUpdateIndexInBackgroundOnPreviousKeyAccessDenied(t *testin
 	require.NoError(t, WriteIndex(ctx, bkt, "user-1", nil, idx))
 
 	// Wait until the index has been updated in background.
-	test.Poll(t, 3*time.Second, nil, func() interface{} {
+	test.Poll(t, 3*time.Second, nil, func() any {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		// Check cached
 		require.NoError(t, loader.checkCachedIndexes(ctx))
@@ -724,7 +726,7 @@ func TestLoader_GetIndex_ShouldCacheKeyDeniedErrors(t *testing.T) {
 	})
 
 	// Request the index multiple times.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, _, err := loader.GetIndex(ctx, "user-1")
 		require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
 	}

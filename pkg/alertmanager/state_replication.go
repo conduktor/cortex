@@ -254,11 +254,11 @@ func (s *state) starting(ctx context.Context) error {
 
 // WaitReady is needed for the pipeline builder to know whenever we've settled and the state is up to date.
 func (s *state) WaitReady(ctx context.Context) error {
-	return s.Service.AwaitRunning(ctx)
+	return s.AwaitRunning(ctx)
 }
 
 func (s *state) Ready() bool {
-	return s.Service.State() == services.Running
+	return s.State() == services.Running
 }
 
 // mergeFullStates attempts to merge all full states received from peers during settling.
@@ -327,9 +327,9 @@ func (c *stateChannel) Broadcast(b []byte) {
 
 // getStateTypeFromKey used for get the state type out of the state key.
 func getStateTypeFromKey(key string) string {
-	index := strings.IndexByte(key, ':')
-	if index < 0 {
+	before, _, ok := strings.Cut(key, ":")
+	if !ok {
 		return key
 	}
-	return key[:index]
+	return before
 }

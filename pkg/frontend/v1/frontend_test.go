@@ -29,6 +29,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/frontend/transport"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/querier/tenantfederation"
 	querier_worker "github.com/cortexproject/cortex/pkg/querier/worker"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
@@ -212,11 +213,14 @@ func TestFrontendMetricsCleanup(t *testing.T) {
 				# HELP cortex_query_frontend_queue_length Number of queries in the queue.
 				# TYPE cortex_query_frontend_queue_length gauge
 				cortex_query_frontend_queue_length{priority="0",type="fifo",user="1"} 0
-			`), "cortex_query_frontend_queue_length"))
+				# HELP cortex_request_queue_requests_total Total number of query requests going to the request queue.
+				# TYPE cortex_request_queue_requests_total counter
+				cortex_request_queue_requests_total{priority="0",user="1"} 1
+			`), "cortex_query_frontend_queue_length", "cortex_request_queue_requests_total"))
 
 			fr.cleanupInactiveUserMetrics("1")
 
-			require.ErrorContains(t, testutil.GatherAndCompare(reg, strings.NewReader(""), "cortex_query_frontend_queue_length"), "expected metric name(s) not found")
+			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(""), "cortex_query_frontend_queue_length", "cortex_request_queue_requests_total"))
 		}
 
 		testFrontend(t, defaultFrontendConfig(), handler, test, matchMaxConcurrency, nil, reg)
@@ -261,6 +265,8 @@ func testFrontend(t *testing.T, config Config, handler http.Handler, test func(a
 
 	// Default HTTP handler config.
 	handlerCfg := transport.HandlerConfig{}
+	tenantFederationCfg := tenantfederation.Config{}
+
 	flagext.DefaultValues(&handlerCfg)
 
 	rt := transport.AdaptGrpcRoundTripperToHTTPRoundTripper(v1)
@@ -268,7 +274,7 @@ func testFrontend(t *testing.T, config Config, handler http.Handler, test func(a
 	r.PathPrefix("/").Handler(middleware.Merge(
 		middleware.AuthenticateUser,
 		middleware.Tracer{},
-	).Wrap(transport.NewHandler(handlerCfg, rt, logger, nil)))
+	).Wrap(transport.NewHandler(handlerCfg, tenantFederationCfg, rt, logger, nil)))
 
 	httpServer := http.Server{
 		Handler: r,

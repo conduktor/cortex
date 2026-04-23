@@ -2,10 +2,11 @@ package storegateway
 
 import (
 	"context"
+	"errors"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -13,10 +14,15 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 const (
 	shardExcludedMeta = "shard-excluded"
+)
+
+var (
+	errBlockNotOwned = errors.New("block not owned")
 )
 
 type ShardingStrategy interface {
@@ -28,6 +34,9 @@ type ShardingStrategy interface {
 	// The provided loaded map contains blocks which have been previously returned by this function and
 	// are now loaded or loading in the store-gateway.
 	FilterBlocks(ctx context.Context, userID string, metas map[ulid.ULID]*metadata.Meta, loaded map[ulid.ULID]struct{}, synced block.GaugeVec) error
+
+	// OwnBlock checks if the block is owned by the current instance.
+	OwnBlock(userID string, meta metadata.Meta) (bool, error)
 }
 
 // ShardingLimits is the interface that should be implemented by the limits provider,
@@ -36,7 +45,7 @@ type ShardingLimits interface {
 	StoreGatewayTenantShardSize(userID string) float64
 }
 
-func filterDisallowedTenants(userIDs []string, logger log.Logger, allowedTenants *util.AllowedTenants) []string {
+func filterDisallowedTenants(userIDs []string, logger log.Logger, allowedTenants *users.AllowedTenants) []string {
 	filteredUserIDs := []string{}
 	for _, userID := range userIDs {
 		if !allowedTenants.IsAllowed(userID) {
@@ -53,10 +62,10 @@ func filterDisallowedTenants(userIDs []string, logger log.Logger, allowedTenants
 // NoShardingStrategy is a no-op strategy. When this strategy is used, no tenant/block is filtered out.
 type NoShardingStrategy struct {
 	logger         log.Logger
-	allowedTenants *util.AllowedTenants
+	allowedTenants *users.AllowedTenants
 }
 
-func NewNoShardingStrategy(logger log.Logger, allowedTenants *util.AllowedTenants) *NoShardingStrategy {
+func NewNoShardingStrategy(logger log.Logger, allowedTenants *users.AllowedTenants) *NoShardingStrategy {
 	return &NoShardingStrategy{
 		logger:         logger,
 		allowedTenants: allowedTenants,
@@ -71,17 +80,21 @@ func (s *NoShardingStrategy) FilterBlocks(_ context.Context, _ string, _ map[uli
 	return nil
 }
 
+func (s *NoShardingStrategy) OwnBlock(_ string, meta metadata.Meta) (bool, error) {
+	return true, nil
+}
+
 // DefaultShardingStrategy is a sharding strategy based on the hash ring formed by store-gateways.
 // Not go-routine safe.
 type DefaultShardingStrategy struct {
 	r              *ring.Ring
 	instanceAddr   string
 	logger         log.Logger
-	allowedTenants *util.AllowedTenants
+	allowedTenants *users.AllowedTenants
 }
 
 // NewDefaultShardingStrategy creates DefaultShardingStrategy.
-func NewDefaultShardingStrategy(r *ring.Ring, instanceAddr string, logger log.Logger, allowedTenants *util.AllowedTenants) *DefaultShardingStrategy {
+func NewDefaultShardingStrategy(r *ring.Ring, instanceAddr string, logger log.Logger, allowedTenants *users.AllowedTenants) *DefaultShardingStrategy {
 	return &DefaultShardingStrategy{
 		r:            r,
 		instanceAddr: instanceAddr,
@@ -102,6 +115,17 @@ func (s *DefaultShardingStrategy) FilterBlocks(_ context.Context, _ string, meta
 	return nil
 }
 
+func (s *DefaultShardingStrategy) OwnBlock(_ string, meta metadata.Meta) (bool, error) {
+	key := cortex_tsdb.HashBlockID(meta.ULID)
+
+	// Check if the block is owned by the store-gateway
+	set, err := s.r.Get(key, BlocksOwnerSync, nil, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	return set.Includes(s.instanceAddr), nil
+}
+
 // ShuffleShardingStrategy is a shuffle sharding strategy, based on the hash ring formed by store-gateways,
 // where each tenant blocks are sharded across a subset of store-gateway instances.
 type ShuffleShardingStrategy struct {
@@ -112,11 +136,11 @@ type ShuffleShardingStrategy struct {
 	logger       log.Logger
 
 	zoneStableShuffleSharding bool
-	allowedTenants            *util.AllowedTenants
+	allowedTenants            *users.AllowedTenants
 }
 
 // NewShuffleShardingStrategy makes a new ShuffleShardingStrategy.
-func NewShuffleShardingStrategy(r *ring.Ring, instanceID, instanceAddr string, limits ShardingLimits, logger log.Logger, allowedTenants *util.AllowedTenants, zoneStableShuffleSharding bool) *ShuffleShardingStrategy {
+func NewShuffleShardingStrategy(r *ring.Ring, instanceID, instanceAddr string, limits ShardingLimits, logger log.Logger, allowedTenants *users.AllowedTenants, zoneStableShuffleSharding bool) *ShuffleShardingStrategy {
 	return &ShuffleShardingStrategy{
 		r:            r,
 		instanceID:   instanceID,
@@ -149,6 +173,18 @@ func (s *ShuffleShardingStrategy) FilterBlocks(_ context.Context, userID string,
 	subRing := GetShuffleShardingSubring(s.r, userID, s.limits, s.zoneStableShuffleSharding)
 	filterBlocksByRingSharding(subRing, s.instanceAddr, metas, loaded, synced, s.logger)
 	return nil
+}
+
+func (s *ShuffleShardingStrategy) OwnBlock(userID string, meta metadata.Meta) (bool, error) {
+	subRing := GetShuffleShardingSubring(s.r, userID, s.limits, s.zoneStableShuffleSharding)
+	key := cortex_tsdb.HashBlockID(meta.ULID)
+
+	// Check if the block is owned by the store-gateway
+	set, err := subRing.Get(key, BlocksOwnerSync, nil, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	return set.Includes(s.instanceAddr), nil
 }
 
 func filterBlocksByRingSharding(r ring.ReadRing, instanceAddr string, metas map[ulid.ULID]*metadata.Meta, loaded map[ulid.ULID]struct{}, synced block.GaugeVec, logger log.Logger) {
@@ -274,4 +310,21 @@ func (a *shardingBucketReaderAdapter) Iter(ctx context.Context, dir string, f fu
 	}
 
 	return a.InstrumentedBucketReader.Iter(ctx, dir, f, options...)
+}
+
+type shardingBlockLifecycleCallbackAdapter struct {
+	userID   string
+	strategy ShardingStrategy
+	logger   log.Logger
+}
+
+func (a *shardingBlockLifecycleCallbackAdapter) PreAdd(meta metadata.Meta) error {
+	own, err := a.strategy.OwnBlock(a.userID, meta)
+	// If unable to check if block is owned or not because of ring error, mark it as owned
+	// and ignore the error.
+	if err != nil || own {
+		return nil
+	}
+	level.Info(a.logger).Log("msg", "block not owned from pre check", "block", meta.ULID.String())
+	return errBlockNotOwned
 }

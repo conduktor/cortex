@@ -23,7 +23,7 @@ func BenchmarkGetNextRequest(b *testing.B) {
 
 	queues := make([]*RequestQueue, 0, b.N)
 
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		queue := NewRequestQueue(maxOutstandingPerTenant,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user", "priority", "type"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user", "priority"}),
@@ -32,12 +32,12 @@ func BenchmarkGetNextRequest(b *testing.B) {
 		)
 		queues = append(queues, queue)
 
-		for ix := 0; ix < queriers; ix++ {
+		for ix := range queriers {
 			queue.RegisterQuerierConnection(fmt.Sprintf("querier-%d", ix))
 		}
 
-		for i := 0; i < maxOutstandingPerTenant; i++ {
-			for j := 0; j < numTenants; j++ {
+		for range maxOutstandingPerTenant {
+			for j := range numTenants {
 				userID := strconv.Itoa(j)
 
 				err := queue.EnqueueRequest(userID, MockRequest{}, 0, nil)
@@ -49,11 +49,10 @@ func BenchmarkGetNextRequest(b *testing.B) {
 	}
 
 	ctx := context.Background()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		idx := FirstUser()
-		for j := 0; j < maxOutstandingPerTenant*numTenants; j++ {
+		for range maxOutstandingPerTenant * numTenants {
 			querier := ""
 		b:
 			// Find querier with at least one request to avoid blocking in getNextRequestForQuerier.
@@ -82,7 +81,7 @@ func BenchmarkQueueRequest(b *testing.B) {
 	users := make([]string, 0, numTenants)
 	requests := make([]MockRequest, 0, numTenants)
 
-	for n := 0; n < b.N; n++ {
+	for n := 0; b.Loop(); n++ {
 		q := NewRequestQueue(maxOutstandingPerTenant,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user", "priority", "type"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user", "priority"}),
@@ -90,22 +89,21 @@ func BenchmarkQueueRequest(b *testing.B) {
 			nil,
 		)
 
-		for ix := 0; ix < queriers; ix++ {
+		for ix := range queriers {
 			q.RegisterQuerierConnection(fmt.Sprintf("querier-%d", ix))
 		}
 
 		queues = append(queues, q)
 
-		for j := 0; j < numTenants; j++ {
+		for j := range numTenants {
 			requests = append(requests, MockRequest{id: fmt.Sprintf("%d-%d", n, j)})
 			users = append(users, strconv.Itoa(j))
 		}
 	}
 
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		for i := 0; i < maxOutstandingPerTenant; i++ {
-			for j := 0; j < numTenants; j++ {
+	for n := 0; b.Loop(); n++ {
+		for range maxOutstandingPerTenant {
+			for j := range numTenants {
 				err := queues[n].EnqueueRequest(users[j], requests[j], 0, nil)
 				if err != nil {
 					b.Fatal(err)
@@ -122,7 +120,7 @@ func BenchmarkGetNextRequestPriorityQueue(b *testing.B) {
 
 	queues := make([]*RequestQueue, 0, b.N)
 
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		queue := NewRequestQueue(maxOutstandingPerTenant,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user", "priority", "type"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user", "priority"}),
@@ -131,12 +129,12 @@ func BenchmarkGetNextRequestPriorityQueue(b *testing.B) {
 		)
 		queues = append(queues, queue)
 
-		for ix := 0; ix < queriers; ix++ {
+		for ix := range queriers {
 			queue.RegisterQuerierConnection(fmt.Sprintf("querier-%d", ix))
 		}
 
-		for i := 0; i < maxOutstandingPerTenant; i++ {
-			for j := 0; j < numTenants; j++ {
+		for i := range maxOutstandingPerTenant {
+			for j := range numTenants {
 				userID := strconv.Itoa(j)
 
 				err := queue.EnqueueRequest(userID, MockRequest{priority: int64(i)}, 0, nil)
@@ -148,11 +146,10 @@ func BenchmarkGetNextRequestPriorityQueue(b *testing.B) {
 	}
 
 	ctx := context.Background()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		idx := FirstUser()
-		for j := 0; j < maxOutstandingPerTenant*numTenants; j++ {
+		for range maxOutstandingPerTenant * numTenants {
 			querier := ""
 		b:
 			// Find querier with at least one request to avoid blocking in getNextRequestForQuerier.
@@ -181,7 +178,7 @@ func BenchmarkQueueRequestPriorityQueue(b *testing.B) {
 	users := make([]string, 0, numTenants)
 	requests := make([]MockRequest, 0, numTenants)
 
-	for n := 0; n < b.N; n++ {
+	for n := 0; b.Loop(); n++ {
 		q := NewRequestQueue(maxOutstandingPerTenant,
 			prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user", "priority", "type"}),
 			prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user", "priority"}),
@@ -189,22 +186,21 @@ func BenchmarkQueueRequestPriorityQueue(b *testing.B) {
 			nil,
 		)
 
-		for ix := 0; ix < queriers; ix++ {
+		for ix := range queriers {
 			q.RegisterQuerierConnection(fmt.Sprintf("querier-%d", ix))
 		}
 
 		queues = append(queues, q)
 
-		for j := 0; j < numTenants; j++ {
+		for j := range numTenants {
 			requests = append(requests, MockRequest{id: fmt.Sprintf("%d-%d", n, j), priority: int64(j)})
 			users = append(users, strconv.Itoa(j))
 		}
 	}
 
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		for i := 0; i < maxOutstandingPerTenant; i++ {
-			for j := 0; j < numTenants; j++ {
+	for n := 0; b.Loop(); n++ {
+		for range maxOutstandingPerTenant {
+			for j := range numTenants {
 				err := queues[n].EnqueueRequest(users[j], requests[j], 0, nil)
 				if err != nil {
 					b.Fatal(err)
@@ -237,12 +233,10 @@ func TestRequestQueue_GetNextRequestForQuerier_ShouldGetRequestAfterReshardingBe
 
 	// Querier-2 waits for a new request.
 	querier2wg := sync.WaitGroup{}
-	querier2wg.Add(1)
-	go func() {
-		defer querier2wg.Done()
+	querier2wg.Go(func() {
 		_, _, err := queue.GetNextRequestForQuerier(ctx, FirstUser(), "querier-2")
 		require.NoError(t, err)
-	}()
+	})
 
 	// Querier-1 crashes (no graceful shutdown notification).
 	queue.UnregisterQuerierConnection("querier-1")
@@ -289,6 +283,60 @@ func TestQueriersShouldGetHighPriorityQueryFirst(t *testing.T) {
 	assert.Equal(t, highPriorityRequest, nextRequest) // high priority request returned, although it was enqueued the last
 }
 
+func TestGetOrAddQueue_ShouldNotDeadlockWhenLimitsAreReduced(t *testing.T) {
+	// Setup: Large initial limit
+	initialLimit := 100
+	newLimit := 50
+
+	limits := MockLimits{
+		MaxOutstanding: initialLimit,
+	}
+
+	// Initialize queues
+	q := newUserQueues(0, limits, nil)
+
+	// Create user queue
+	userID := "test-user-deadlock"
+	queue := q.getOrAddQueue(userID, 1)
+
+	// Fill queue to capacity (near initialLimit)
+	// We fill it more than newLimit
+	itemsToFill := 80
+	for range itemsToFill {
+		queue.enqueueRequest(MockRequest{priority: 1})
+	}
+
+	require.Equal(t, itemsToFill, queue.length())
+
+	// Reduce limit below current size
+	// We change the mock limits return value.
+	// In real app this comes from runtime config reload.
+	limits.MaxOutstanding = newLimit
+	q.limits = limits // Update strict reference in queues struct (mocking the reload effect)
+
+	// Now call getOrAddQueue again.
+	// This triggers the migration logic: existing queue (80 items) -> new queue (cap 50).
+	done := make(chan struct{})
+	go func() {
+		_ = q.getOrAddQueue(userID, 1)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: no deadlock
+	case <-time.After(2 * time.Second):
+		t.Fatal("Deadlock detected! getOrAddQueue timed out while migrating queue with reduced limits.")
+	}
+
+	// The new queue should be capped at newLimit or contain what managed to fit.
+	// Logic: it breaks when full. So new queue should be full (length == newLimit).
+	newQueue := q.getOrAddQueue(userID, 1) // Should be fast now
+
+	// Note: The actual items in queue should be newLimit (50). The rest (30) are dropped.
+	assert.Equal(t, newLimit, newQueue.length())
+}
+
 func TestReservedQueriersShouldOnlyGetHighPriorityQueries(t *testing.T) {
 	queue := NewRequestQueue(0,
 		prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user", "priority", "type"}),
@@ -310,6 +358,8 @@ func TestReservedQueriersShouldOnlyGetHighPriorityQueries(t *testing.T) {
 	ctx := context.Background()
 
 	queue.RegisterQuerierConnection("querier-1")
+	queue.RegisterQuerierConnection("querier-2")
+	maxQueriers := float64(2)
 
 	normalRequest := MockRequest{
 		id: "normal query",
@@ -319,14 +369,20 @@ func TestReservedQueriersShouldOnlyGetHighPriorityQueries(t *testing.T) {
 		priority: 1,
 	}
 
-	assert.NoError(t, queue.EnqueueRequest("userID", normalRequest, 1, func() {}))
-	assert.NoError(t, queue.EnqueueRequest("userID", priority1Request, 1, func() {}))
-	assert.NoError(t, queue.EnqueueRequest("userID", priority1Request, 1, func() {}))
+	assert.NoError(t, queue.EnqueueRequest("userID", normalRequest, maxQueriers, func() {}))
+	assert.NoError(t, queue.EnqueueRequest("userID", priority1Request, maxQueriers, func() {}))
+	assert.NoError(t, queue.EnqueueRequest("userID", priority1Request, maxQueriers, func() {}))
+	reservedQueriers := queue.queues.userQueues["userID"].reservedQueriers
+	require.Equal(t, 1, len(reservedQueriers))
+	reservedQuerier := ""
+	for qid := range reservedQueriers {
+		reservedQuerier = qid
+	}
 
-	nextRequest, _, _ := queue.GetNextRequestForQuerier(ctx, FirstUser(), "querier-1")
+	nextRequest, _, _ := queue.GetNextRequestForQuerier(ctx, FirstUser(), reservedQuerier)
 	assert.Equal(t, priority1Request, nextRequest)
 
-	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctx, FirstUser(), "querier-1")
+	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctx, FirstUser(), reservedQuerier)
 	assert.Equal(t, priority1Request, nextRequest)
 
 	ctxTimeout, cancel := context.WithTimeout(ctx, 1*time.Second)
@@ -335,11 +391,11 @@ func TestReservedQueriersShouldOnlyGetHighPriorityQueries(t *testing.T) {
 	time.AfterFunc(2*time.Second, func() {
 		queue.cond.Broadcast()
 	})
-	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctxTimeout, FirstUser(), "querier-1")
+	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctxTimeout, FirstUser(), reservedQuerier)
 	assert.Nil(t, nextRequest)
 	assert.Equal(t, 1, queue.queues.userQueues["userID"].queue.length())
 
-	assert.NoError(t, queue.EnqueueRequest("userID", normalRequest, 1, func() {}))
+	assert.NoError(t, queue.EnqueueRequest("userID", normalRequest, maxQueriers, func() {}))
 
 	ctxTimeout, cancel = context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
@@ -347,7 +403,7 @@ func TestReservedQueriersShouldOnlyGetHighPriorityQueries(t *testing.T) {
 	time.AfterFunc(2*time.Second, func() {
 		queue.cond.Broadcast()
 	})
-	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctxTimeout, FirstUser(), "querier-1")
+	nextRequest, _, _ = queue.GetNextRequestForQuerier(ctxTimeout, FirstUser(), reservedQuerier)
 	assert.Nil(t, nextRequest)
 	assert.Equal(t, 2, queue.queues.userQueues["userID"].queue.length())
 }

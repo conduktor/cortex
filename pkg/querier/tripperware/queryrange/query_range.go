@@ -3,7 +3,6 @@ package queryrange
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,15 +10,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gogo/status"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/prometheus/common/model"
+	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/weaveworks/common/httpgrpc"
 
+	"github.com/cortexproject/cortex/pkg/api/queryapi"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
@@ -33,9 +35,6 @@ var (
 		SortMapKeys:            true,
 		ValidateJsonRawMessage: false,
 	}.Froze()
-	errEndBeforeStart = httpgrpc.Errorf(http.StatusBadRequest, "end timestamp must not be before start time")
-	errNegativeStep   = httpgrpc.Errorf(http.StatusBadRequest, "zero or negative query resolution step widths are not accepted. Try a positive integer")
-	errStepTooSmall   = httpgrpc.Errorf(http.StatusBadRequest, "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
 
 	// Name of the cache control header.
 	cacheControlHeader = "Cache-Control"
@@ -56,11 +55,35 @@ func (resp *PrometheusResponse) HTTPHeaders() map[string][]string {
 }
 
 type prometheusCodec struct {
-	sharded bool
+	tripperware.Codec
+	sharded          bool
+	compression      tripperware.Compression
+	defaultCodecType tripperware.CodecType
 }
 
-func NewPrometheusCodec(sharded bool) *prometheusCodec { //nolint:revive
-	return &prometheusCodec{sharded: sharded}
+func NewPrometheusCodec(sharded bool, compressionStr string, defaultCodecTypeStr string) *prometheusCodec { //nolint:revive
+	compression := tripperware.NonCompression // default
+	switch compressionStr {
+	case string(tripperware.GzipCompression):
+		compression = tripperware.GzipCompression
+
+	case string(tripperware.SnappyCompression):
+		compression = tripperware.SnappyCompression
+
+	case string(tripperware.ZstdCompression):
+		compression = tripperware.ZstdCompression
+	}
+
+	defaultCodecType := tripperware.JsonCodecType // default
+	if defaultCodecTypeStr == string(tripperware.ProtobufCodecType) {
+		defaultCodecType = tripperware.ProtobufCodecType
+	}
+
+	return &prometheusCodec{
+		sharded:          sharded,
+		compression:      compression,
+		defaultCodecType: defaultCodecType,
+	}
 }
 
 func (c prometheusCodec) MergeResponse(ctx context.Context, req tripperware.Request, responses ...tripperware.Response) (tripperware.Response, error) {
@@ -84,31 +107,31 @@ func (c prometheusCodec) DecodeRequest(_ context.Context, r *http.Request, forwa
 	var err error
 	result.Start, err = util.ParseTime(r.FormValue("start"))
 	if err != nil {
-		return nil, decorateWithParamName(err, "start")
+		return nil, queryapi.DecorateWithParamName(err, "start")
 	}
 
 	result.End, err = util.ParseTime(r.FormValue("end"))
 	if err != nil {
-		return nil, decorateWithParamName(err, "end")
+		return nil, queryapi.DecorateWithParamName(err, "end")
 	}
 
 	if result.End < result.Start {
-		return nil, errEndBeforeStart
+		return nil, queryapi.ErrEndBeforeStart
 	}
 
 	result.Step, err = util.ParseDurationMs(r.FormValue("step"))
 	if err != nil {
-		return nil, decorateWithParamName(err, "step")
+		return nil, queryapi.DecorateWithParamName(err, "step")
 	}
 
 	if result.Step <= 0 {
-		return nil, errNegativeStep
+		return nil, queryapi.ErrNegativeStep
 	}
 
 	// For safety, limit the number of returned points per timeseries.
 	// This is sufficient for 60s resolution for a week or 1h resolution for a year.
 	if (result.End-result.Start)/result.Step > 11000 {
-		return nil, errStepTooSmall
+		return nil, queryapi.ErrStepTooSmall
 	}
 
 	result.Query = r.FormValue("query")
@@ -135,7 +158,22 @@ func (c prometheusCodec) DecodeRequest(_ context.Context, r *http.Request, forwa
 	return &result, nil
 }
 
-func (prometheusCodec) EncodeRequest(ctx context.Context, r tripperware.Request) (*http.Request, error) {
+// getSerializedBody serializes the logical plan from a Prometheus request.
+// Returns an empty byte array if the logical plan is nil.
+func (c prometheusCodec) getSerializedBody(promReq *tripperware.PrometheusRequest) ([]byte, error) {
+	var byteLP []byte
+	var err error
+
+	if promReq.LogicalPlan != nil {
+		byteLP, err = logicalplan.Marshal(promReq.LogicalPlan.Root())
+		if err != nil {
+			return nil, err
+		}
+	}
+	return byteLP, nil
+}
+
+func (c prometheusCodec) EncodeRequest(ctx context.Context, r tripperware.Request) (*http.Request, error) {
 	promReq, ok := r.(*tripperware.PrometheusRequest)
 	if !ok {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, "invalid request format")
@@ -158,22 +196,31 @@ func (prometheusCodec) EncodeRequest(ctx context.Context, r tripperware.Request)
 			h.Add(n, v)
 		}
 	}
+	h.Add("Content-Type", "application/x-www-form-urlencoded")
 
-	// Always ask gzip to the querier
-	h.Set("Accept-Encoding", "gzip")
+	tripperware.SetRequestHeaders(h, c.defaultCodecType, c.compression)
+
+	bodyBytes, err := c.getSerializedBody(promReq)
+	if err != nil {
+		return nil, err
+	}
+
+	form := url.Values{}
+	form.Set("plan", string(bodyBytes))
+	formEncoded := form.Encode()
 
 	req := &http.Request{
-		Method:     "GET",
+		Method:     "POST",
 		RequestURI: u.String(), // This is what the httpgrpc code looks at.
 		URL:        u,
-		Body:       http.NoBody,
+		Body:       io.NopCloser(strings.NewReader(formEncoded)),
 		Header:     h,
 	}
 
 	return req.WithContext(ctx), nil
 }
 
-func (prometheusCodec) DecodeResponse(ctx context.Context, r *http.Response, _ tripperware.Request) (tripperware.Response, error) {
+func (c prometheusCodec) DecodeResponse(ctx context.Context, r *http.Response, _ tripperware.Request) (tripperware.Response, error) {
 	log, ctx := spanlogger.New(ctx, "ParseQueryRangeResponse") //nolint:ineffassign,staticcheck
 	defer log.Finish()
 
@@ -181,19 +228,50 @@ func (prometheusCodec) DecodeResponse(ctx context.Context, r *http.Response, _ t
 		return nil, err
 	}
 
-	buf, err := tripperware.BodyBuffer(r, log)
+	responseSizeHeader := r.Header.Get("X-Uncompressed-Length")
+	responseSizeLimiter := limiter.ResponseSizeLimiterFromContextWithFallback(ctx)
+	responseSize, hasSizeHeader, err := tripperware.ParseResponseSizeHeader(responseSizeHeader)
 	if err != nil {
 		log.Error(err)
 		return nil, err
 	}
-	if r.StatusCode/100 != 2 {
-		return nil, httpgrpc.Errorf(r.StatusCode, string(buf))
+	if hasSizeHeader {
+		if err := responseSizeLimiter.AddResponseBytes(responseSize); err != nil {
+			return nil, httpgrpc.Errorf(http.StatusUnprocessableEntity, "%s", err.Error())
+		}
 	}
-	log.LogFields(otlog.Int("bytes", len(buf)))
+
+	body, err := tripperware.BodyBytes(r, log)
+	if err != nil {
+		log.Error(err)
+		return nil, err
+	}
+
+	if !hasSizeHeader {
+		if err := responseSizeLimiter.AddResponseBytes(len(body)); err != nil {
+			return nil, httpgrpc.Errorf(http.StatusUnprocessableEntity, "%s", err.Error())
+		}
+	}
+
+	if r.StatusCode/100 != 2 {
+		return nil, httpgrpc.Errorf(r.StatusCode, "%s", string(body))
+	}
+	log.LogFields(otlog.Int("bytes", len(body)))
 
 	var resp tripperware.PrometheusResponse
-	if err := json.Unmarshal(buf, &resp); err != nil {
+	err = tripperware.UnmarshalResponse(r, body, &resp)
+
+	if err != nil {
 		return nil, httpgrpc.Errorf(http.StatusInternalServerError, "error decoding response: %v", err)
+	}
+
+	// protobuf serialization treats empty slices as nil
+	if resp.Data.ResultType == model.ValMatrix.String() && resp.Data.Result.GetMatrix().SampleStreams == nil {
+		resp.Data.Result.GetMatrix().SampleStreams = []tripperware.SampleStream{}
+	}
+
+	if resp.Headers == nil {
+		resp.Headers = []*tripperware.PrometheusResponseHeader{}
 	}
 
 	for h, hv := range r.Header {
@@ -202,7 +280,7 @@ func (prometheusCodec) DecodeResponse(ctx context.Context, r *http.Response, _ t
 	return &resp, nil
 }
 
-func (prometheusCodec) EncodeResponse(ctx context.Context, res tripperware.Response) (*http.Response, error) {
+func (prometheusCodec) EncodeResponse(ctx context.Context, _ *http.Request, res tripperware.Response) (*http.Response, error) {
 	sp, _ := opentracing.StartSpanFromContext(ctx, "APIResponse.ToHTTPResponse")
 	defer sp.Finish()
 
@@ -214,6 +292,9 @@ func (prometheusCodec) EncodeResponse(ctx context.Context, res tripperware.Respo
 	if a != nil {
 		m := a.Data.Result.GetMatrix()
 		sp.LogFields(otlog.Int("series", len(m.GetSampleStreams())))
+
+		queryStats := stats.FromContext(ctx)
+		tripperware.SetQueryResponseStats(a, queryStats)
 	}
 
 	b, err := json.Marshal(a)
@@ -225,7 +306,7 @@ func (prometheusCodec) EncodeResponse(ctx context.Context, res tripperware.Respo
 
 	resp := http.Response{
 		Header: http.Header{
-			"Content-Type": []string{"application/json"},
+			"Content-Type": []string{tripperware.ApplicationJson},
 		},
 		Body:          io.NopCloser(bytes.NewBuffer(b)),
 		StatusCode:    http.StatusOK,
@@ -236,12 +317,4 @@ func (prometheusCodec) EncodeResponse(ctx context.Context, res tripperware.Respo
 
 func encodeDurationMs(d int64) string {
 	return strconv.FormatFloat(float64(d)/float64(time.Second/time.Millisecond), 'f', -1, 64)
-}
-
-func decorateWithParamName(err error, field string) error {
-	errTmpl := "invalid parameter %q; %v"
-	if status, ok := status.FromError(err); ok {
-		return httpgrpc.Errorf(int(status.Code()), errTmpl, field, status.Message())
-	}
-	return fmt.Errorf(errTmpl, field, err)
 }

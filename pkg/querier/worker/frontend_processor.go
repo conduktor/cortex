@@ -17,6 +17,7 @@ import (
 	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/util/backoff"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
 )
 
 var (
@@ -129,19 +130,16 @@ func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.H
 	for _, h := range request.Headers {
 		headers[h.Key] = h.Values[0]
 	}
-	headerMap := make(map[string]string, 0)
-	// Remove non-existent header.
-	for _, header := range fp.targetHeaders {
-		if v, ok := headers[textproto.CanonicalMIMEHeaderKey(header)]; ok {
-			headerMap[header] = v
-		}
-	}
+	ctx = requestmeta.ContextWithRequestMetadataMapFromHeaders(ctx, headers, fp.targetHeaders)
+
 	orgID, ok := headers[textproto.CanonicalMIMEHeaderKey(user.OrgIDHeaderName)]
 	if ok {
 		ctx = user.InjectOrgID(ctx, orgID)
 	}
-	ctx = util_log.ContextWithHeaderMap(ctx, headerMap)
 	logger := util_log.WithContext(ctx, fp.log)
+	if statsEnabled {
+		level.Info(logger).Log("msg", "started running request")
+	}
 
 	response, err := fp.handler.Handle(ctx, request)
 	if err != nil {
@@ -157,6 +155,9 @@ func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.H
 	if statsEnabled {
 		level.Info(logger).Log("msg", "finished request", "status_code", response.Code, "response_size", len(response.GetBody()))
 	}
+
+	// Compute timing breakdown before sending stats back to the frontend.
+	stats.ComputeAndStoreTimingBreakdown()
 
 	// Ensure responses that are too big are not retried.
 	if len(response.Body) >= fp.maxMessageSize {

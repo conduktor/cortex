@@ -177,17 +177,13 @@ func captureOutput(t *testing.T) *capturedOutput {
 		stderrReader: stderrR,
 		stderrWriter: stderrW,
 	}
-	co.wg.Add(1)
-	go func() {
-		defer co.wg.Done()
+	co.wg.Go(func() {
 		io.Copy(&co.stdoutBuf, stdoutR)
-	}()
+	})
 
-	co.wg.Add(1)
-	go func() {
-		defer co.wg.Done()
+	co.wg.Go(func() {
 		io.Copy(&co.stderrBuf, stderrR)
-	}()
+	})
 
 	return co
 }
@@ -225,7 +221,6 @@ func TestExpandEnv(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.in, func(t *testing.T) {
 			_ = os.Setenv("y", "y")
 			output := expandEnv([]byte(test.in))
@@ -263,7 +258,6 @@ func TestParseConfigFileParameter(t *testing.T) {
 		{"--config.expand-env --opt1 --config.file=foo", "foo", true},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.args, func(t *testing.T) {
 			args := strings.Split(test.args, " ")
 			configFile, expandENV := parseConfigFileParameter(args)

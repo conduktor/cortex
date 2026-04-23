@@ -9,12 +9,13 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -38,6 +39,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -60,7 +62,7 @@ var (
 	errInvalidCompactionStrategy             = errors.New("invalid compaction strategy")
 	errInvalidCompactionStrategyPartitioning = errors.New("compaction strategy partitioning can only be enabled when shuffle sharding is enabled")
 
-	DefaultBlocksGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, blocksMarkedForNoCompaction prometheus.Counter, _ prometheus.Counter, _ prometheus.Counter, syncerMetrics *compact.SyncerMetrics, compactorMetrics *compactorMetrics, _ *ring.Ring, _ *ring.Lifecycler, _ Limits, _ string, _ *compact.GatherNoCompactionMarkFilter) compact.Grouper {
+	DefaultBlocksGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, blocksMarkedForNoCompaction prometheus.Counter, _ prometheus.Counter, _ prometheus.Counter, syncerMetrics *compact.SyncerMetrics, compactorMetrics *compactorMetrics, _ *ring.Ring, _ *ring.Lifecycler, _ Limits, _ string, _ *compact.GatherNoCompactionMarkFilter, _ int) compact.Grouper {
 		return compact.NewDefaultGrouperWithMetrics(
 			logger,
 			bkt,
@@ -79,9 +81,31 @@ var (
 			cfg.BlocksFetchConcurrency)
 	}
 
-	ShuffleShardingGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, blocksMarkedForNoCompaction prometheus.Counter, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, syncerMetrics *compact.SyncerMetrics, compactorMetrics *compactorMetrics, ring *ring.Ring, ringLifecycle *ring.Lifecycler, limits Limits, userID string, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter) compact.Grouper {
+	ShuffleShardingGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.InstrumentedBucket, logger log.Logger, blocksMarkedForNoCompaction prometheus.Counter, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, syncerMetrics *compact.SyncerMetrics, compactorMetrics *compactorMetrics, ring *ring.Ring, ringLifecycle *ring.Lifecycler, limits Limits, userID string, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ingestionReplicationFactor int) compact.Grouper {
 		if cfg.CompactionStrategy == util.CompactionStrategyPartitioning {
-			return NewPartitionCompactionGrouper(ctx, logger, bkt)
+			return NewPartitionCompactionGrouper(
+				ctx,
+				logger,
+				bkt,
+				cfg.AcceptMalformedIndex,
+				true, // Enable vertical compaction
+				blocksMarkedForNoCompaction,
+				syncerMetrics,
+				compactorMetrics,
+				metadata.NoneFunc,
+				cfg,
+				ring,
+				ringLifecycle.Addr,
+				ringLifecycle.ID,
+				limits,
+				userID,
+				cfg.BlockFilesConcurrency,
+				cfg.BlocksFetchConcurrency,
+				cfg.CompactionConcurrency,
+				true,
+				cfg.CompactionVisitMarkerTimeout,
+				noCompactionMarkFilter.NoCompactMarkedBlocks,
+				ingestionReplicationFactor)
 		} else {
 			return NewShuffleShardingGrouper(
 				ctx,
@@ -102,7 +126,7 @@ var (
 				cfg.BlockFilesConcurrency,
 				cfg.BlocksFetchConcurrency,
 				cfg.CompactionConcurrency,
-				cfg.BlockVisitMarkerTimeout,
+				cfg.CompactionVisitMarkerTimeout,
 				blockVisitMarkerReadFailed,
 				blockVisitMarkerWriteFailed,
 				noCompactionMarkFilter.NoCompactMarkedBlocks)
@@ -110,12 +134,12 @@ var (
 	}
 
 	DefaultBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, PlannerFactory, error) {
-		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
+		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, util_log.GoKitLogToSlog(logger), cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, _ string, _ prometheus.Counter, _ prometheus.Counter, _ *compactorMetrics) compact.Planner {
+		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, _ string, _ prometheus.Counter, _ prometheus.Counter, _ *compactorMetrics, _ *block.IgnoreDeletionMarkFilter) compact.Planner {
 			return compact.NewPlanner(logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter)
 		}
 
@@ -123,20 +147,44 @@ var (
 	}
 
 	ShuffleShardingBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, PlannerFactory, error) {
-		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
+		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, util_log.GoKitLogToSlog(logger), cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, userID string, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, compactorMetrics *compactorMetrics) compact.Planner {
+		plannerFactory := func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger, cfg Config, noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter, ringLifecycle *ring.Lifecycler, userID string, blockVisitMarkerReadFailed prometheus.Counter, blockVisitMarkerWriteFailed prometheus.Counter, compactorMetrics *compactorMetrics, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter) compact.Planner {
 
 			if cfg.CompactionStrategy == util.CompactionStrategyPartitioning {
-				return NewPartitionCompactionPlanner(ctx, bkt, logger)
+				return NewPartitionCompactionPlanner(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, userID, cfg.ShardingPlannerDelay, cfg.CompactionVisitMarkerTimeout, cfg.CompactionVisitMarkerFileUpdateInterval, compactorMetrics, ignoreDeletionMarkFilter)
 			} else {
-				return NewShuffleShardingPlanner(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, cfg.BlockVisitMarkerTimeout, cfg.BlockVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed)
+				return NewShuffleShardingPlanner(ctx, bkt, logger, cfg.BlockRanges.ToMilliseconds(), noCompactionMarkFilter.NoCompactMarkedBlocks, ringLifecycle.ID, cfg.CompactionVisitMarkerTimeout, cfg.CompactionVisitMarkerFileUpdateInterval, blockVisitMarkerReadFailed, blockVisitMarkerWriteFailed)
 			}
 		}
 		return compactor, plannerFactory, nil
+	}
+
+	DefaultBlockDeletableCheckerFactory = func(_ context.Context, _ objstore.InstrumentedBucket, _ log.Logger) compact.BlockDeletableChecker {
+		return compact.DefaultBlockDeletableChecker{}
+	}
+
+	PartitionCompactionBlockDeletableCheckerFactory = func(ctx context.Context, bkt objstore.InstrumentedBucket, logger log.Logger) compact.BlockDeletableChecker {
+		return NewPartitionCompactionBlockDeletableChecker()
+	}
+
+	DefaultCompactionLifecycleCallbackFactory = func(_ context.Context, _ objstore.InstrumentedBucket, _ log.Logger, _ int, _ string, _ string, _ *compactorMetrics) compact.CompactionLifecycleCallback {
+		return compact.DefaultCompactionLifecycleCallback{}
+	}
+
+	ShardedCompactionLifecycleCallbackFactory = func(ctx context.Context, userBucket objstore.InstrumentedBucket, logger log.Logger, metaSyncConcurrency int, compactDir string, userID string, compactorMetrics *compactorMetrics) compact.CompactionLifecycleCallback {
+		return NewShardedCompactionLifecycleCallback(
+			ctx,
+			userBucket,
+			logger,
+			metaSyncConcurrency,
+			compactDir,
+			userID,
+			compactorMetrics,
+		)
 	}
 )
 
@@ -156,6 +204,7 @@ type BlocksGrouperFactory func(
 	limit Limits,
 	userID string,
 	noCompactionMarkFilter *compact.GatherNoCompactionMarkFilter,
+	ingestionReplicationFactor int,
 ) compact.Grouper
 
 // BlocksCompactorFactory builds and returns the compactor and planner to use to compact a tenant's blocks.
@@ -177,11 +226,30 @@ type PlannerFactory func(
 	blockVisitMarkerReadFailed prometheus.Counter,
 	blockVisitMarkerWriteFailed prometheus.Counter,
 	compactorMetrics *compactorMetrics,
+	ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter,
 ) compact.Planner
+
+type CompactionLifecycleCallbackFactory func(
+	ctx context.Context,
+	userBucket objstore.InstrumentedBucket,
+	logger log.Logger,
+	metaSyncConcurrency int,
+	compactDir string,
+	userID string,
+	compactorMetrics *compactorMetrics,
+) compact.CompactionLifecycleCallback
+
+type BlockDeletableCheckerFactory func(
+	ctx context.Context,
+	bkt objstore.InstrumentedBucket,
+	logger log.Logger,
+) compact.BlockDeletableChecker
 
 // Limits defines limits used by the Compactor.
 type Limits interface {
-	CompactorTenantShardSize(userID string) int
+	CompactorTenantShardSize(userID string) float64
+	CompactorPartitionIndexSizeBytes(userID string) int64
+	CompactorPartitionSeriesCount(userID string) int64
 }
 
 // Config holds the Compactor config.
@@ -209,12 +277,13 @@ type Config struct {
 	DisabledTenants flagext.StringSliceCSV `yaml:"disabled_tenants"`
 
 	// Compactors sharding.
-	ShardingEnabled  bool       `yaml:"sharding_enabled"`
-	ShardingStrategy string     `yaml:"sharding_strategy"`
-	ShardingRing     RingConfig `yaml:"sharding_ring"`
+	ShardingEnabled      bool          `yaml:"sharding_enabled"`
+	ShardingStrategy     string        `yaml:"sharding_strategy"`
+	ShardingRing         RingConfig    `yaml:"sharding_ring"`
+	ShardingPlannerDelay time.Duration `yaml:"sharding_planner_delay"`
 
-	// Compaction mode.
-	CompactionStrategy string `yaml:"compaction_mode"`
+	// Compaction strategy.
+	CompactionStrategy string `yaml:"compaction_strategy"`
 
 	// No need to add options to customize the retry backoff,
 	// given the defaults should be fine, but allow to override
@@ -226,16 +295,17 @@ type Config struct {
 	BlocksGrouperFactory   BlocksGrouperFactory   `yaml:"-"`
 	BlocksCompactorFactory BlocksCompactorFactory `yaml:"-"`
 
-	// Block visit marker file config
-	BlockVisitMarkerTimeout            time.Duration `yaml:"block_visit_marker_timeout"`
-	BlockVisitMarkerFileUpdateInterval time.Duration `yaml:"block_visit_marker_file_update_interval"`
+	// Compaction visit marker file config
+	CompactionVisitMarkerTimeout            time.Duration `yaml:"compaction_visit_marker_timeout"`
+	CompactionVisitMarkerFileUpdateInterval time.Duration `yaml:"compaction_visit_marker_file_update_interval"`
 
 	// Cleaner visit marker file config
 	CleanerVisitMarkerTimeout            time.Duration `yaml:"cleaner_visit_marker_timeout"`
 	CleanerVisitMarkerFileUpdateInterval time.Duration `yaml:"cleaner_visit_marker_file_update_interval"`
 
-	AcceptMalformedIndex bool `yaml:"accept_malformed_index"`
-	CachingBucketEnabled bool `yaml:"caching_bucket_enabled"`
+	AcceptMalformedIndex        bool `yaml:"accept_malformed_index"`
+	CachingBucketEnabled        bool `yaml:"caching_bucket_enabled"`
+	CleanerCachingBucketEnabled bool `yaml:"cleaner_caching_bucket_enabled"`
 }
 
 // RegisterFlags registers the Compactor flags.
@@ -258,7 +328,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.CleanupConcurrency, "compactor.cleanup-concurrency", 20, "Max number of tenants for which blocks cleanup and maintenance should run concurrently.")
 	f.BoolVar(&cfg.ShardingEnabled, "compactor.sharding-enabled", false, "Shard tenants across multiple compactor instances. Sharding is required if you run multiple compactor instances, in order to coordinate compactions and avoid race conditions leading to the same tenant blocks simultaneously compacted by different instances.")
 	f.StringVar(&cfg.ShardingStrategy, "compactor.sharding-strategy", util.ShardingStrategyDefault, fmt.Sprintf("The sharding strategy to use. Supported values are: %s.", strings.Join(supportedShardingStrategies, ", ")))
-	f.StringVar(&cfg.CompactionStrategy, "compactor.compaction-mode", util.CompactionStrategyDefault, fmt.Sprintf("The compaction strategy to use. Supported values are: %s.", strings.Join(supportedCompactionStrategies, ", ")))
+	f.StringVar(&cfg.CompactionStrategy, "compactor.compaction-strategy", util.CompactionStrategyDefault, fmt.Sprintf("The compaction strategy to use. Supported values are: %s.", strings.Join(supportedCompactionStrategies, ", ")))
 	f.DurationVar(&cfg.DeletionDelay, "compactor.deletion-delay", 12*time.Hour, "Time before a block marked for deletion is deleted from bucket. "+
 		"If not 0, blocks will be marked for deletion and compactor component will permanently delete blocks marked for deletion from the bucket. "+
 		"If 0, blocks will be deleted straight away. Note that deleting blocks immediately can cause query failures.")
@@ -271,21 +341,22 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&cfg.EnabledTenants, "compactor.enabled-tenants", "Comma separated list of tenants that can be compacted. If specified, only these tenants will be compacted by compactor, otherwise all tenants can be compacted. Subject to sharding.")
 	f.Var(&cfg.DisabledTenants, "compactor.disabled-tenants", "Comma separated list of tenants that cannot be compacted by this compactor. If specified, and compactor would normally pick given tenant for compaction (via -compactor.enabled-tenants or sharding), it will be ignored instead.")
 
-	f.DurationVar(&cfg.BlockVisitMarkerTimeout, "compactor.block-visit-marker-timeout", 5*time.Minute, "How long block visit marker file should be considered as expired and able to be picked up by compactor again.")
-	f.DurationVar(&cfg.BlockVisitMarkerFileUpdateInterval, "compactor.block-visit-marker-file-update-interval", 1*time.Minute, "How frequently block visit marker file should be updated duration compaction.")
+	f.DurationVar(&cfg.CompactionVisitMarkerTimeout, "compactor.compaction-visit-marker-timeout", 10*time.Minute, "How long compaction visit marker file should be considered as expired and able to be picked up by compactor again.")
+	f.DurationVar(&cfg.CompactionVisitMarkerFileUpdateInterval, "compactor.compaction-visit-marker-file-update-interval", 1*time.Minute, "How frequently compaction visit marker file should be updated duration compaction.")
 
 	f.DurationVar(&cfg.CleanerVisitMarkerTimeout, "compactor.cleaner-visit-marker-timeout", 10*time.Minute, "How long cleaner visit marker file should be considered as expired and able to be picked up by cleaner again. The value should be smaller than -compactor.cleanup-interval")
 	f.DurationVar(&cfg.CleanerVisitMarkerFileUpdateInterval, "compactor.cleaner-visit-marker-file-update-interval", 5*time.Minute, "How frequently cleaner visit marker file should be updated when cleaning user.")
 
 	f.BoolVar(&cfg.AcceptMalformedIndex, "compactor.accept-malformed-index", false, "When enabled, index verification will ignore out of order label names.")
 	f.BoolVar(&cfg.CachingBucketEnabled, "compactor.caching-bucket-enabled", false, "When enabled, caching bucket will be used for compactor, except cleaner service, which serves as the source of truth for block status")
+	f.BoolVar(&cfg.CleanerCachingBucketEnabled, "compactor.cleaner-caching-bucket-enabled", false, "When enabled, caching bucket will be used for cleaner")
+
+	f.DurationVar(&cfg.ShardingPlannerDelay, "compactor.sharding-planner-delay", 10*time.Second, "How long shuffle sharding planner would wait before running planning code. This delay would prevent double compaction when two compactors claimed same partition in grouper at same time.")
 }
 
 func (cfg *Config) Validate(limits validation.Limits) error {
-	for _, blockRange := range cfg.BlockRanges {
-		if blockRange == 0 {
-			return errors.New("compactor block range period cannot be zero")
-		}
+	if slices.Contains(cfg.BlockRanges, 0) {
+		return errors.New("compactor block range period cannot be zero")
 	}
 	// Each block range period should be divisible by the previous one.
 	for i := 1; i < len(cfg.BlockRanges); i++ {
@@ -295,7 +366,7 @@ func (cfg *Config) Validate(limits validation.Limits) error {
 	}
 
 	// Make sure a valid sharding strategy is being used
-	if !util.StringsContain(supportedShardingStrategies, cfg.ShardingStrategy) {
+	if !slices.Contains(supportedShardingStrategies, cfg.ShardingStrategy) {
 		return errInvalidShardingStrategy
 	}
 
@@ -305,8 +376,8 @@ func (cfg *Config) Validate(limits validation.Limits) error {
 		}
 	}
 
-	// Make sure a valid compaction mode is being used
-	if !util.StringsContain(supportedCompactionStrategies, cfg.CompactionStrategy) {
+	// Make sure a valid compaction strategy is being used
+	if !slices.Contains(supportedCompactionStrategies, cfg.CompactionStrategy) {
 		return errInvalidCompactionStrategy
 	}
 
@@ -320,6 +391,7 @@ func (cfg *Config) Validate(limits validation.Limits) error {
 // ConfigProvider defines the per-tenant config provider for the Compactor.
 type ConfigProvider interface {
 	bucket.TenantConfigProvider
+	ParquetConverterEnabled(userID string) bool
 	CompactorBlocksRetentionPeriod(user string) time.Duration
 }
 
@@ -332,7 +404,7 @@ type Compactor struct {
 	logger         log.Logger
 	parentLogger   log.Logger
 	registerer     prometheus.Registerer
-	allowedTenants *util.AllowedTenants
+	allowedTenants *users.AllowedTenants
 	limits         *validation.Overrides
 
 	// Functions that creates bucket client, grouper, planner and compactor using the context.
@@ -342,7 +414,9 @@ type Compactor struct {
 	blocksCompactorFactory BlocksCompactorFactory
 
 	// Users scanner, used to discover users from the bucket.
-	usersScanner *cortex_tsdb.UsersScanner
+	usersScanner users.Scanner
+
+	userIndexUpdater *users.UserIndexUpdater
 
 	// Blocks cleaner is responsible to hard delete blocks marked for deletion.
 	blocksCleaner *BlocksCleaner
@@ -351,6 +425,10 @@ type Compactor struct {
 	blocksCompactor compact.Compactor
 
 	blocksPlannerFactory PlannerFactory
+
+	blockDeletableCheckerFactory BlockDeletableCheckerFactory
+
+	compactionLifecycleCallbackFactory CompactionLifecycleCallbackFactory
 
 	// Client used to run operations on the bucket storing blocks.
 	bucketClient objstore.InstrumentedBucket
@@ -379,12 +457,15 @@ type Compactor struct {
 
 	// Thanos compactor metrics per user
 	compactorMetrics *compactorMetrics
+
+	// Replication factor of ingester ring
+	ingestionReplicationFactor int
 }
 
 // NewCompactor makes a new Compactor.
-func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfig, logger log.Logger, registerer prometheus.Registerer, limits *validation.Overrides) (*Compactor, error) {
+func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfig, logger log.Logger, registerer prometheus.Registerer, limits *validation.Overrides, ingestionReplicationFactor int) (*Compactor, error) {
 	bucketClientFactory := func(ctx context.Context) (objstore.InstrumentedBucket, error) {
-		return bucket.NewClient(ctx, storageCfg.Bucket, "compactor", logger, registerer)
+		return bucket.NewClient(ctx, storageCfg.Bucket, nil, "compactor", logger, registerer)
 	}
 
 	blocksGrouperFactory := compactorCfg.BlocksGrouperFactory
@@ -405,7 +486,25 @@ func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfi
 		}
 	}
 
-	cortexCompactor, err := newCompactor(compactorCfg, storageCfg, logger, registerer, bucketClientFactory, blocksGrouperFactory, blocksCompactorFactory, limits)
+	var blockDeletableCheckerFactory BlockDeletableCheckerFactory
+	if compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle && compactorCfg.CompactionStrategy == util.CompactionStrategyPartitioning {
+		blockDeletableCheckerFactory = PartitionCompactionBlockDeletableCheckerFactory
+	} else {
+		blockDeletableCheckerFactory = DefaultBlockDeletableCheckerFactory
+	}
+
+	var compactionLifecycleCallbackFactory CompactionLifecycleCallbackFactory
+	if compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle && compactorCfg.CompactionStrategy == util.CompactionStrategyPartitioning {
+		compactionLifecycleCallbackFactory = ShardedCompactionLifecycleCallbackFactory
+	} else {
+		compactionLifecycleCallbackFactory = DefaultCompactionLifecycleCallbackFactory
+	}
+
+	if ingestionReplicationFactor <= 0 {
+		ingestionReplicationFactor = 1
+	}
+
+	cortexCompactor, err := newCompactor(compactorCfg, storageCfg, logger, registerer, bucketClientFactory, blocksGrouperFactory, blocksCompactorFactory, blockDeletableCheckerFactory, compactionLifecycleCallbackFactory, limits, ingestionReplicationFactor)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create Cortex blocks compactor")
 	}
@@ -421,7 +520,10 @@ func newCompactor(
 	bucketClientFactory func(ctx context.Context) (objstore.InstrumentedBucket, error),
 	blocksGrouperFactory BlocksGrouperFactory,
 	blocksCompactorFactory BlocksCompactorFactory,
+	blockDeletableCheckerFactory BlockDeletableCheckerFactory,
+	compactionLifecycleCallbackFactory CompactionLifecycleCallbackFactory,
 	limits *validation.Overrides,
+	ingestionReplicationFactor int,
 ) (*Compactor, error) {
 	var compactorMetrics *compactorMetrics
 	if compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
@@ -430,15 +532,17 @@ func newCompactor(
 		compactorMetrics = newDefaultCompactorMetrics(registerer)
 	}
 	c := &Compactor{
-		compactorCfg:           compactorCfg,
-		storageCfg:             storageCfg,
-		parentLogger:           logger,
-		logger:                 log.With(logger, "component", "compactor"),
-		registerer:             registerer,
-		bucketClientFactory:    bucketClientFactory,
-		blocksGrouperFactory:   blocksGrouperFactory,
-		blocksCompactorFactory: blocksCompactorFactory,
-		allowedTenants:         util.NewAllowedTenants(compactorCfg.EnabledTenants, compactorCfg.DisabledTenants),
+		compactorCfg:                       compactorCfg,
+		storageCfg:                         storageCfg,
+		parentLogger:                       logger,
+		logger:                             log.With(logger, "component", "compactor"),
+		registerer:                         registerer,
+		bucketClientFactory:                bucketClientFactory,
+		blocksGrouperFactory:               blocksGrouperFactory,
+		blocksCompactorFactory:             blocksCompactorFactory,
+		blockDeletableCheckerFactory:       blockDeletableCheckerFactory,
+		compactionLifecycleCallbackFactory: compactionLifecycleCallbackFactory,
+		allowedTenants:                     users.NewAllowedTenants(compactorCfg.EnabledTenants, compactorCfg.DisabledTenants),
 
 		CompactorStartDurationSeconds: promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
 			Name: "cortex_compactor_start_duration_seconds",
@@ -496,8 +600,9 @@ func newCompactor(
 			Name: "cortex_compactor_block_visit_marker_write_failed",
 			Help: "Number of block visit marker file failed to be written.",
 		}),
-		limits:           limits,
-		compactorMetrics: compactorMetrics,
+		limits:                     limits,
+		compactorMetrics:           compactorMetrics,
+		ingestionReplicationFactor: ingestionReplicationFactor,
 	}
 
 	if len(compactorCfg.EnabledTenants) > 0 {
@@ -550,14 +655,37 @@ func (c *Compactor) starting(ctx context.Context) error {
 	// Wrap the bucket client to write block deletion marks in the global location too.
 	c.bucketClient = bucketindex.BucketWithGlobalMarkers(c.bucketClient)
 
+	cleanerBucketClient := c.bucketClient
+	if c.compactorCfg.CleanerCachingBucketEnabled {
+		cleanerBucketClient, err = cortex_tsdb.CreateCachingBucketForCompactor(c.storageCfg.BucketStore.MetadataCache, true, c.bucketClient, c.logger, extprom.WrapRegistererWith(prometheus.Labels{"component": "cleaner"}, c.registerer))
+		if err != nil {
+			return errors.Wrap(err, "create caching bucket for cleaner")
+		}
+	}
+
+	if c.compactorCfg.CachingBucketEnabled {
+		c.bucketClient, err = cortex_tsdb.CreateCachingBucketForCompactor(c.storageCfg.BucketStore.MetadataCache, false, c.bucketClient, c.logger, extprom.WrapRegistererWith(prometheus.Labels{"component": "compactor"}, c.registerer))
+		if err != nil {
+			return errors.Wrap(err, "create caching bucket for compactor")
+		}
+	}
+
 	// Create the users scanner.
-	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUserForCleanUp, c.parentLogger)
+	c.usersScanner, err = users.NewScanner(c.storageCfg.UsersScanner, c.bucketClient, c.logger, extprom.WrapRegistererWith(prometheus.Labels{"component": "compactor"}, c.registerer))
+	if err != nil {
+		return errors.Wrap(err, "failed to create users scanner")
+	}
 
 	var cleanerRingLifecyclerID = "default-cleaner"
 	// Initialize the compactors ring if sharding is enabled.
 	if c.compactorCfg.ShardingEnabled {
 		lifecyclerCfg := c.compactorCfg.ShardingRing.ToLifecyclerConfig()
-		c.ringLifecycler, err = ring.NewLifecycler(lifecyclerCfg, ring.NewNoopFlushTransferer(), "compactor", ringKey, true, false, c.logger, prometheus.WrapRegistererWithPrefix("cortex_", c.registerer))
+		var delegate ring.LifecyclerDelegate
+		delegate = &ring.DefaultLifecyclerDelegate{}
+		if c.compactorCfg.ShardingRing.AutoForgetDelay > 0 {
+			delegate = ring.NewLifecyclerAutoForgetDelegate(c.compactorCfg.ShardingRing.AutoForgetDelay, delegate, c.logger)
+		}
+		c.ringLifecycler, err = ring.NewLifecyclerWithDelegate(lifecyclerCfg, ring.NewNoopFlushTransferer(), "compactor", ringKey, true, false, c.logger, prometheus.WrapRegistererWithPrefix("cortex_", c.registerer), delegate)
 		if err != nil {
 			return errors.Wrap(err, "unable to initialize compactor ring lifecycler")
 		}
@@ -613,6 +741,8 @@ func (c *Compactor) starting(ctx context.Context) error {
 		}
 	}
 
+	// Cleaner needs a users scanner that is sharded.
+	cleanerUsersScanner := users.NewShardedScanner(c.usersScanner, c.ownUserForCleanUp, c.logger)
 	// Create the blocks cleaner (service).
 	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
 		DeletionDelay:                      c.compactorCfg.DeletionDelay,
@@ -620,26 +750,22 @@ func (c *Compactor) starting(ctx context.Context) error {
 		CleanupConcurrency:                 c.compactorCfg.CleanupConcurrency,
 		BlockDeletionMarksMigrationEnabled: c.compactorCfg.BlockDeletionMarksMigrationEnabled,
 		TenantCleanupDelay:                 c.compactorCfg.TenantCleanupDelay,
-	}, c.bucketClient, c.usersScanner, c.limits, c.parentLogger, cleanerRingLifecyclerID, c.registerer, c.compactorCfg.CleanerVisitMarkerTimeout, c.compactorCfg.CleanerVisitMarkerFileUpdateInterval,
-		c.compactorMetrics.syncerBlocksMarkedForDeletion)
+		ShardingStrategy:                   c.compactorCfg.ShardingStrategy,
+		CompactionStrategy:                 c.compactorCfg.CompactionStrategy,
+		BlockRanges:                        c.compactorCfg.BlockRanges.ToMilliseconds(),
+	}, cleanerBucketClient, cleanerUsersScanner, c.compactorCfg.CompactionVisitMarkerTimeout, c.limits, c.parentLogger, cleanerRingLifecyclerID, c.registerer, c.compactorCfg.CleanerVisitMarkerTimeout, c.compactorCfg.CleanerVisitMarkerFileUpdateInterval,
+		c.compactorMetrics.syncerBlocksMarkedForDeletion, c.compactorMetrics.remainingPlannedCompactions)
 
-	// Ensure an initial cleanup occurred before starting the compactor.
-	if err := services.StartAndAwaitRunning(ctx, c.blocksCleaner); err != nil {
-		c.ringSubservices.StopAsync()
-		return errors.Wrap(err, "failed to start the blocks cleaner")
+	// If sharding is disabled, there is no need to have every compactor to run the user index updater
+	// as it will be the same to fallback to list strategy.
+	if c.compactorCfg.ShardingEnabled && c.storageCfg.UsersScanner.Strategy == users.UserScanStrategyUserIndex {
+		// We hardcode strategy to be list so can ignore error.
+		baseScanner, _ := users.NewScanner(users.UsersScannerConfig{
+			Strategy: users.UserScanStrategyList,
+		}, c.bucketClient, c.logger, c.registerer)
+		c.userIndexUpdater = users.NewUserIndexUpdater(c.bucketClient, c.storageCfg.UsersScanner.UpdateInterval, baseScanner, extprom.WrapRegistererWith(prometheus.Labels{"component": "compactor"}, c.registerer))
 	}
 
-	if c.compactorCfg.CachingBucketEnabled {
-		matchers := cortex_tsdb.NewMatchers()
-		// Do not cache tenant deletion marker and block deletion marker for compactor
-		matchers.SetMetaFileMatcher(func(name string) bool {
-			return strings.HasSuffix(name, "/"+metadata.MetaFilename)
-		})
-		c.bucketClient, err = cortex_tsdb.CreateCachingBucket(cortex_tsdb.ChunksCacheConfig{}, c.storageCfg.BucketStore.MetadataCache, matchers, c.bucketClient, c.logger, extprom.WrapRegistererWith(prometheus.Labels{"component": "compactor"}, c.registerer))
-		if err != nil {
-			return errors.Wrap(err, "create caching bucket")
-		}
-	}
 	return nil
 }
 
@@ -659,15 +785,34 @@ func (c *Compactor) stopping(_ error) error {
 }
 
 func (c *Compactor) running(ctx context.Context) error {
+	// Ensure an initial cleanup occurred as first thing when running compactor.
+	if err := services.StartAndAwaitRunning(ctx, c.blocksCleaner); err != nil {
+		c.ringSubservices.StopAsync()
+		return errors.Wrap(err, "failed to start the blocks cleaner")
+	}
+
+	if c.userIndexUpdater != nil {
+		go c.userIndexUpdateLoop(ctx)
+	}
+
 	// Run an initial compaction before starting the interval.
+	// Insert jitter right before compaction starts to avoid multiple starting compactor to be in sync
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Duration(rand.Int63n(int64(float64(c.compactorCfg.CompactionInterval) * 0.1)))):
+	}
 	c.compactUsers(ctx)
 
-	ticker := time.NewTicker(util.DurationWithJitter(c.compactorCfg.CompactionInterval, 0.05))
+	ticker := time.NewTicker(c.compactorCfg.CompactionInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			// Insert jitter right before compaction starts, so that there will always
+			// have jitter even compaction time is longer than CompactionInterval
+			time.Sleep(time.Duration(rand.Int63n(int64(float64(c.compactorCfg.CompactionInterval) * 0.1))))
 			c.compactUsers(ctx)
 		case <-ctx.Done():
 			return nil
@@ -678,23 +823,19 @@ func (c *Compactor) running(ctx context.Context) error {
 }
 
 func (c *Compactor) compactUsers(ctx context.Context) {
-	failed := false
+	succeeded := false
 	interrupted := false
+	compactionErrorCount := 0
 
 	c.CompactionRunsStarted.Inc()
 
 	defer func() {
-		// interruptions and successful runs are considered
-		// mutually exclusive but we consider a run failed if any
-		// tenant runs failed even if later runs are interrupted
-		if !interrupted && !failed {
+		if succeeded && compactionErrorCount == 0 {
 			c.CompactionRunsCompleted.Inc()
 			c.CompactionRunsLastSuccess.SetToCurrentTime()
-		}
-		if interrupted {
+		} else if interrupted {
 			c.CompactionRunsInterrupted.Inc()
-		}
-		if failed {
+		} else {
 			c.CompactionRunsFailed.Inc()
 		}
 
@@ -706,26 +847,25 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 	}()
 
 	level.Info(c.logger).Log("msg", "discovering users from bucket")
-	users, err := c.discoverUsersWithRetries(ctx)
+	userIDs, err := c.discoverUsersWithRetries(ctx)
 	if err != nil {
-		failed = true
 		level.Error(c.logger).Log("msg", "failed to discover users from bucket", "err", err)
 		return
 	}
 
-	level.Info(c.logger).Log("msg", "discovered users from bucket", "users", len(users))
-	c.CompactionRunDiscoveredTenants.Set(float64(len(users)))
+	level.Info(c.logger).Log("msg", "discovered users from bucket", "users", len(userIDs))
+	c.CompactionRunDiscoveredTenants.Set(float64(len(userIDs)))
 
 	// When starting multiple compactor replicas nearly at the same time, running in a cluster with
 	// a large number of tenants, we may end up in a situation where the 1st user is compacted by
 	// multiple replicas at the same time. Shuffling users helps reduce the likelihood this will happen.
-	rand.Shuffle(len(users), func(i, j int) {
-		users[i], users[j] = users[j], users[i]
+	rand.Shuffle(len(userIDs), func(i, j int) {
+		userIDs[i], userIDs[j] = userIDs[j], userIDs[i]
 	})
 
 	// Keep track of users owned by this shard, so that we can delete the local files for all other users.
 	ownedUsers := map[string]struct{}{}
-	for _, userID := range users {
+	for _, userID := range userIDs {
 		// Ensure the context has not been canceled (ie. compactor shutdown has been triggered).
 		if ctx.Err() != nil {
 			interrupted = true
@@ -755,12 +895,13 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 
 		ownedUsers[userID] = struct{}{}
 
-		if markedForDeletion, err := cortex_tsdb.TenantDeletionMarkExists(ctx, c.bucketClient, userID); err != nil {
+		if markedForDeletion, err := users.TenantDeletionMarkExists(ctx, c.bucketClient, userID); err != nil {
 			c.CompactionRunSkippedTenants.Inc()
 			level.Warn(c.logger).Log("msg", "unable to check if user is marked for deletion", "user", userID, "err", err)
 			continue
 		} else if markedForDeletion {
 			c.CompactionRunSkippedTenants.Inc()
+			c.compactorMetrics.deleteMetricsForDeletedTenant(userID)
 			level.Debug(c.logger).Log("msg", "skipping user because it is marked for deletion", "user", userID)
 			continue
 		}
@@ -776,7 +917,7 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 			}
 
 			c.CompactionRunFailedTenants.Inc()
-			failed = true
+			compactionErrorCount++
 			level.Error(c.logger).Log("msg", "failed to compact user blocks", "user", userID, "err", err)
 			continue
 		}
@@ -811,6 +952,7 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 			}
 		}
 	}
+	succeeded = true
 }
 
 func (c *Compactor) compactUserWithRetries(ctx context.Context, userID string) error {
@@ -845,6 +987,11 @@ func (c *Compactor) compactUserWithRetries(ctx context.Context, userID string) e
 		retries.Wait()
 	}
 
+	err := errors.Unwrap(errors.Cause(lastErr))
+	if errors.Is(err, plannerCompletedPartitionError) || errors.Is(err, plannerVisitedPartitionError) {
+		return nil
+	}
+
 	return lastErr
 }
 
@@ -858,7 +1005,12 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 
 	// Filters out duplicate blocks that can be formed from two or more overlapping
 	// blocks that fully submatches the source blocks of the older blocks.
-	deduplicateBlocksFilter := block.NewDeduplicateFilter(c.compactorCfg.BlockSyncConcurrency)
+	var deduplicateBlocksFilter CortexMetadataFilter
+	if c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle && c.compactorCfg.CompactionStrategy == util.CompactionStrategyPartitioning {
+		deduplicateBlocksFilter = &disabledDeduplicateFilter{}
+	} else {
+		deduplicateBlocksFilter = block.NewDeduplicateFilter(c.compactorCfg.BlockSyncConcurrency)
+	}
 
 	// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
 	// No delay is used -- all blocks with deletion marker are ignored, and not considered for compaction.
@@ -873,7 +1025,8 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(ulogger, bucket, c.compactorCfg.MetaSyncConcurrency)
 
 	var blockLister block.Lister
-	switch cortex_tsdb.BlockDiscoveryStrategy(c.storageCfg.BucketStore.BlockDiscoveryStrategy) {
+	blockDiscoveryStrategy := cortex_tsdb.BlockDiscoveryStrategy(c.storageCfg.BucketStore.BlockDiscoveryStrategy)
+	switch blockDiscoveryStrategy {
 	case cortex_tsdb.ConcurrentDiscovery:
 		blockLister = block.NewConcurrentLister(ulogger, bucket)
 	case cortex_tsdb.RecursiveDiscovery:
@@ -887,6 +1040,26 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		return cortex_tsdb.ErrBlockDiscoveryStrategy
 	}
 
+	// List of filters to apply (order matters).
+	filterList := []block.MetadataFilter{
+		// Remove the ingester ID because we don't shard blocks anymore, while still
+		// honoring the shard ID if sharding was done in the past.
+		NewLabelRemoverFilter([]string{cortex_tsdb.IngesterIDExternalLabel}),
+		block.NewConsistencyDelayMetaFilter(ulogger, c.compactorCfg.ConsistencyDelay, reg),
+	}
+
+	// Add ignoreDeletionMarkFilter only when not using bucket index discovery or using default compaction strategy.
+	// CompactionStrategyDefault would mark parent blocks for deletion after compaction is finished. ShuffleShardingGrouper
+	// should ignore blocks marked for deletion during grouping stage directly.
+	if blockDiscoveryStrategy != cortex_tsdb.BucketIndexDiscovery || c.compactorCfg.CompactionStrategy == util.CompactionStrategyDefault {
+		filterList = append(filterList, ignoreDeletionMarkFilter)
+	}
+
+	filterList = append(filterList,
+		deduplicateBlocksFilter,
+		noCompactMarkerFilter,
+	)
+
 	fetcher, err := block.NewMetaFetcherWithMetrics(
 		ulogger,
 		c.compactorCfg.MetaSyncConcurrency,
@@ -895,16 +1068,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		c.metaSyncDirForUser(userID),
 		c.compactorMetrics.getBaseFetcherMetrics(),
 		c.compactorMetrics.getMetaFetcherMetrics(),
-		// List of filters to apply (order matters).
-		[]block.MetadataFilter{
-			// Remove the ingester ID because we don't shard blocks anymore, while still
-			// honoring the shard ID if sharding was done in the past.
-			NewLabelRemoverFilter([]string{cortex_tsdb.IngesterIDExternalLabel}),
-			block.NewConsistencyDelayMetaFilter(ulogger, c.compactorCfg.ConsistencyDelay, reg),
-			ignoreDeletionMarkFilter,
-			deduplicateBlocksFilter,
-			noCompactMarkerFilter,
-		},
+		filterList,
 	)
 	if err != nil {
 		return err
@@ -918,6 +1082,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		fetcher,
 		deduplicateBlocksFilter,
 		ignoreDeletionMarkFilter,
+		c.compactorCfg.CompactionInterval,
 	)
 	if err != nil {
 		return errors.Wrap(err, "failed to create syncer")
@@ -925,22 +1090,26 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 
 	currentCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	compactor, err := compact.NewBucketCompactor(
+	compactor, err := compact.NewBucketCompactorWithCheckerAndCallback(
 		ulogger,
 		syncer,
-		c.blocksGrouperFactory(currentCtx, c.compactorCfg, bucket, ulogger, c.BlocksMarkedForNoCompaction, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, syncerMetrics, c.compactorMetrics, c.ring, c.ringLifecycler, c.limits, userID, noCompactMarkerFilter),
-		c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, userID, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, c.compactorMetrics),
+		c.blocksGrouperFactory(currentCtx, c.compactorCfg, bucket, ulogger, c.BlocksMarkedForNoCompaction, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, syncerMetrics, c.compactorMetrics, c.ring, c.ringLifecycler, c.limits, userID, noCompactMarkerFilter, c.ingestionReplicationFactor),
+		c.blocksPlannerFactory(currentCtx, bucket, ulogger, c.compactorCfg, noCompactMarkerFilter, c.ringLifecycler, userID, c.blockVisitMarkerReadFailed, c.blockVisitMarkerWriteFailed, c.compactorMetrics, ignoreDeletionMarkFilter),
 		c.blocksCompactor,
+		c.blockDeletableCheckerFactory(currentCtx, bucket, ulogger),
+		c.compactionLifecycleCallbackFactory(currentCtx, bucket, ulogger, c.compactorCfg.MetaSyncConcurrency, c.compactDirForUser(userID), userID, c.compactorMetrics),
 		c.compactDirForUser(userID),
 		bucket,
 		c.compactorCfg.CompactionConcurrency,
 		c.compactorCfg.SkipBlocksWithOutOfOrderChunksEnabled,
+		nil, // Pass nil for blocksCleaner to maintain current behavior.
 	)
 	if err != nil {
 		return errors.Wrap(err, "failed to create bucket compactor")
 	}
 
 	if err := compactor.Compact(ctx); err != nil {
+		level.Warn(ulogger).Log("msg", "compaction failed with error", "err", err)
 		return errors.Wrap(err, "compaction")
 	}
 
@@ -977,15 +1146,16 @@ func (c *Compactor) discoverUsersWithRetries(ctx context.Context) ([]string, err
 	return nil, lastErr
 }
 
+// discoverUsers returns all users that are active and deleting. Deleted users are not included.
 func (c *Compactor) discoverUsers(ctx context.Context) ([]string, error) {
-	var users []string
-
-	err := c.bucketClient.Iter(ctx, "", func(entry string) error {
-		users = append(users, strings.TrimSuffix(entry, "/"))
-		return nil
-	})
-
-	return users, err
+	activeUsers, deletingUsers, _, err := c.usersScanner.ScanUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	users := make([]string, 0, len(activeUsers)+len(deletingUsers))
+	users = append(users, activeUsers...)
+	users = append(users, deletingUsers...)
+	return users, nil
 }
 
 func (c *Compactor) ownUserForCompaction(userID string) (bool, error) {
@@ -994,6 +1164,10 @@ func (c *Compactor) ownUserForCompaction(userID string) (bool, error) {
 
 func (c *Compactor) ownUserForCleanUp(userID string) (bool, error) {
 	return c.ownUser(userID, true)
+}
+
+func (c *Compactor) getShardSizeForUser(userID string) int {
+	return util.DynamicShardSize(c.limits.CompactorTenantShardSize(userID), c.ring.InstancesCount())
 }
 
 func (c *Compactor) ownUser(userID string, isCleanUp bool) (bool, error) {
@@ -1009,7 +1183,8 @@ func (c *Compactor) ownUser(userID string, isCleanUp bool) (bool, error) {
 	// If we aren't cleaning up user blocks, and we are using shuffle-sharding, ownership is determined by a subring
 	// Cleanup should only be owned by a single compactor, as there could be race conditions during block deletion
 	if !isCleanUp && c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
-		subRing := c.ring.ShuffleShard(userID, c.limits.CompactorTenantShardSize(userID))
+		shardSize := c.getShardSizeForUser(userID)
+		subRing := c.ring.ShuffleShard(userID, shardSize)
 
 		rs, err := subRing.GetAllHealthy(RingOp)
 		if err != nil {
@@ -1035,6 +1210,39 @@ func (c *Compactor) ownUser(userID string, isCleanUp bool) (bool, error) {
 	}
 
 	return rs.Instances[0].Addr == c.ringLifecycler.Addr, nil
+}
+
+func (c *Compactor) userIndexUpdateLoop(ctx context.Context) {
+	// Hardcode ID to check which compactor owns updating user index.
+	userID := users.UserIndexCompressedFilename
+	// Align with clean up interval.
+	ticker := time.NewTicker(util.DurationWithJitter(c.storageCfg.UsersScanner.UpdateInterval, 0.1))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			level.Error(c.logger).Log("msg", "context timeout, exit user index update loop", "err", ctx.Err())
+			return
+		case <-ticker.C:
+			owned, err := c.ownUser(userID, true)
+			if err != nil {
+				level.Error(c.logger).Log("msg", "failed to check if compactor owns updating user index", "err", err)
+				// Wait for next interval. Worst case, the user index scanner will fallback to list strategy.
+				continue
+			}
+			if !owned {
+				continue
+			}
+			start := time.Now()
+			if err := c.userIndexUpdater.UpdateUserIndex(ctx); err != nil {
+				level.Error(c.logger).Log("msg", "failed to update user index", "err", err)
+				// Wait for next interval. Worst case, the user index scanner will fallback to list strategy.
+				continue
+			}
+			level.Info(c.logger).Log("msg", "successfully updated user index", "duration_ms", time.Since(start).Milliseconds())
+		}
+	}
 }
 
 const compactorMetaPrefix = "compactor-meta-"
@@ -1087,12 +1295,7 @@ func (c *Compactor) isCausedByPermissionDenied(err error) bool {
 		cause = errors.Unwrap(cause)
 	}
 	if multiErr, ok := cause.(errutil.NonNilMultiRootError); ok {
-		for _, err := range multiErr {
-			if c.isPermissionDeniedErr(err) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(multiErr, c.isPermissionDeniedErr)
 	}
 	return c.isPermissionDeniedErr(cause)
 }
@@ -1106,4 +1309,25 @@ func (c *Compactor) isPermissionDeniedErr(err error) bool {
 		return false
 	}
 	return s.Code() == codes.PermissionDenied
+}
+
+type CortexMetadataFilter interface {
+	block.DeduplicateFilter
+	block.MetadataFilter
+}
+
+// disabledDeduplicateFilter is only used by Partitioning Compaction. Because Partitioning Compaction
+// would always generate multiple result blocks (different partitions) for the same time range compaction.
+// Those result blocks would always have same source blocks. Those result blocks should not be marked
+// as duplicates when grouping for the next level of compaction. So DeduplicateFilter is disabled.
+type disabledDeduplicateFilter struct {
+}
+
+func (f *disabledDeduplicateFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced block.GaugeVec, modified block.GaugeVec) error {
+	// don't do any deduplicate filtering
+	return nil
+}
+
+func (f *disabledDeduplicateFilter) DuplicateIDs() []ulid.ULID {
+	return nil
 }

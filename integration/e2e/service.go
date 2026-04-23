@@ -15,6 +15,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/thanos-io/thanos/pkg/runutil"
 
 	"github.com/cortexproject/cortex/pkg/util/backoff"
@@ -48,6 +49,9 @@ type ConcreteService struct {
 	// docker NetworkName used to start this container.
 	// If empty it means service is stopped.
 	usedNetworkName string
+
+	// workDir is the working directory inside the container
+	workDir string
 }
 
 func NewConcreteService(
@@ -90,6 +94,10 @@ func (s *ConcreteService) SetEnvVars(env map[string]string) {
 
 func (s *ConcreteService) SetUser(user string) {
 	s.user = user
+}
+
+func (s *ConcreteService) SetWorkDir(workDir string) {
+	s.workDir = workDir
 }
 
 func (s *ConcreteService) Start(networkName, sharedDir string) (err error) {
@@ -151,6 +159,15 @@ func (s *ConcreteService) Stop() error {
 		logger.Log(string(out))
 		return err
 	}
+
+	s.Wait()
+
+	// Ensure the container is fully removed before returning. Even though
+	// containers are started with --rm, Docker removes them asynchronously
+	// after the process exits. Without this explicit removal, restarting a
+	// container with the same name can fail with "name already in use".
+	_, _ = RunCommandAndGetOutput("docker", "rm", "--force", s.containerName())
+
 	s.usedNetworkName = ""
 
 	return nil
@@ -168,13 +185,26 @@ func (s *ConcreteService) Kill() error {
 		return err
 	}
 
-	// Wait until the container actually stopped. However, this could fail if
-	// the container already exited, so we just ignore the error.
-	_, _ = RunCommandAndGetOutput("docker", "wait", s.containerName())
+	s.Wait()
+
+	// Ensure the container is fully removed before returning. Even though
+	// containers are started with --rm, Docker removes them asynchronously
+	// after the process exits. Without this explicit removal, restarting a
+	// container with the same name can fail with "name already in use".
+	_, _ = RunCommandAndGetOutput("docker", "rm", "--force", s.containerName())
 
 	s.usedNetworkName = ""
 
 	return nil
+}
+
+// Wait waits until the service is stopped.
+func (s *ConcreteService) Wait() {
+	// Wait until the container actually stopped. However, this could fail if
+	// the container already exited, so we just ignore the error.
+	if out, err := RunCommandAndGetOutput("docker", "wait", s.containerName()); err != nil {
+		logger.Log(string(out))
+	}
 }
 
 // Endpoint returns external (from host perspective) service endpoint (host:port) for given internal port.
@@ -309,6 +339,10 @@ func (s *ConcreteService) buildDockerRunArgs(networkName, sharedDir string) []st
 		args = append(args, "--user", s.user)
 	}
 
+	if s.workDir != "" {
+		args = append(args, "--workdir", s.workDir)
+	}
+
 	// Published ports
 	for _, port := range s.networkPorts {
 		args = append(args, "-p", strconv.Itoa(port))
@@ -406,9 +440,10 @@ func NewHTTPReadinessProbe(port int, path string, expectedStatusRangeStart, expe
 
 func (p *HTTPReadinessProbe) Ready(service *ConcreteService) (err error) {
 	endpoint := service.Endpoint(p.port)
-	if endpoint == "" {
+	switch endpoint {
+	case "":
 		return fmt.Errorf("cannot get service endpoint for port %d", p.port)
-	} else if endpoint == "stopped" {
+	case "stopped":
 		return errors.New("service has stopped")
 	}
 
@@ -446,9 +481,10 @@ func NewTCPReadinessProbe(port int) *TCPReadinessProbe {
 
 func (p *TCPReadinessProbe) Ready(service *ConcreteService) (err error) {
 	endpoint := service.Endpoint(p.port)
-	if endpoint == "" {
+	switch endpoint {
+	case "":
 		return fmt.Errorf("cannot get service endpoint for port %d", p.port)
-	} else if endpoint == "stopped" {
+	case "stopped":
 		return errors.New("service has stopped")
 	}
 
@@ -480,7 +516,7 @@ type LinePrefixLogger struct {
 }
 
 func (w *LinePrefixLogger) Write(p []byte) (n int, err error) {
-	for _, line := range strings.Split(string(p), "\n") {
+	for line := range strings.SplitSeq(string(p), "\n") {
 		// Skip empty lines
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -600,7 +636,7 @@ func (s *HTTPService) SumMetrics(metricNames []string, opts ...MetricsOption) ([
 		return nil, err
 	}
 
-	var tp expfmt.TextParser
+	tp := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
 	if err != nil {
 		return nil, err
@@ -647,7 +683,7 @@ func (s *HTTPService) WaitRemovedMetric(metricName string, opts ...MetricsOption
 		}
 
 		// Parse metrics.
-		var tp expfmt.TextParser
+		tp := expfmt.NewTextParser(model.LegacyValidation)
 		families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
 		if err != nil {
 			return err
@@ -675,7 +711,7 @@ func (s *HTTPService) WaitRemovedMetric(metricName string, opts ...MetricsOption
 func parseDockerIPv4Port(out string) (int, error) {
 	// The "docker port" output may be multiple lines if both IPv4 and IPv6 are supported,
 	// so we need to parse each line.
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		matches := dockerIPv4PortPattern.FindStringSubmatch(strings.TrimSpace(line))
 		if len(matches) != 2 {
 			continue

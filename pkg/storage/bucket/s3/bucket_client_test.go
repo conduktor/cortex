@@ -184,8 +184,12 @@ type mockBucket struct {
 	calledCount int
 }
 
+func (m *mockBucket) Provider() objstore.ObjProvider {
+	return objstore.FILESYSTEM
+}
+
 // Upload mocks objstore.Bucket.Upload()
-func (m *mockBucket) Upload(ctx context.Context, name string, r io.Reader) error {
+func (m *mockBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) error {
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
 		return err
@@ -206,6 +210,16 @@ func (m *mockBucket) Delete(ctx context.Context, name string) error {
 // Name mocks objstore.Bucket.Name()
 func (m *mockBucket) Name() string {
 	return "mock"
+}
+
+// IterWithAttributes mocks objstore.Bucket.IterWithAttributes()
+func (m *mockBucket) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return nil
+}
+
+// SupportedIterOptions mocks objstore.Bucket.SupportedIterOptions()
+func (m *mockBucket) SupportedIterOptions() []objstore.IterOptionType {
+	return nil
 }
 
 // Iter mocks objstore.Bucket.Iter()

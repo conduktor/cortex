@@ -76,7 +76,6 @@ func TestNewClient(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
 			// Load config
@@ -87,7 +86,7 @@ func TestNewClient(t *testing.T) {
 			require.NoError(t, err)
 
 			// Instance a new bucket client from the config
-			bucketClient, err := NewClient(context.Background(), cfg, "test", util_log.Logger, nil)
+			bucketClient, err := NewClient(context.Background(), cfg, nil, "test", util_log.Logger, nil)
 			require.Equal(t, testData.expectedErr, err)
 
 			if testData.expectedErr == nil {
@@ -145,10 +144,8 @@ func TestClientMock_MockGet(t *testing.T) {
 	// Run many goroutines all requesting the same mocked object and
 	// ensure there's no race.
 	wg := sync.WaitGroup{}
-	for i := 0; i < 1000; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 1000 {
+		wg.Go(func() {
 
 			reader, err := m.Get(context.Background(), "test")
 			require.NoError(t, err)
@@ -157,7 +154,7 @@ func TestClientMock_MockGet(t *testing.T) {
 			require.Equal(t, []byte(expected), actual)
 
 			require.NoError(t, reader.Close())
-		}()
+		})
 	}
 
 	wg.Wait()

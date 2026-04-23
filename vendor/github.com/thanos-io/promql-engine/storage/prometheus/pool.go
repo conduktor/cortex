@@ -17,20 +17,20 @@ var sep = []byte{'\xff'}
 type SelectorPool struct {
 	selectors map[uint64]*seriesSelector
 
-	queryable storage.Queryable
+	querier storage.Querier
 }
 
-func NewSelectorPool(queryable storage.Queryable) *SelectorPool {
+func NewSelectorPool(querier storage.Querier) *SelectorPool {
 	return &SelectorPool{
 		selectors: make(map[uint64]*seriesSelector),
-		queryable: queryable,
+		querier:   querier,
 	}
 }
 
 func (p *SelectorPool) GetSelector(mint, maxt, step int64, matchers []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
 	key := hashMatchers(matchers, mint, maxt, hints)
 	if _, ok := p.selectors[key]; !ok {
-		p.selectors[key] = newSeriesSelector(p.queryable, mint, maxt, step, matchers, hints)
+		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
 	}
 	return p.selectors[key]
 }
@@ -38,7 +38,7 @@ func (p *SelectorPool) GetSelector(mint, maxt, step int64, matchers []*labels.Ma
 func (p *SelectorPool) GetFilteredSelector(mint, maxt, step int64, matchers, filters []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
 	key := hashMatchers(matchers, mint, maxt, hints)
 	if _, ok := p.selectors[key]; !ok {
-		p.selectors[key] = newSeriesSelector(p.queryable, mint, maxt, step, matchers, hints)
+		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
 	}
 
 	return NewFilteredSelector(p.selectors[key], NewFilter(filters))
@@ -55,6 +55,8 @@ func hashMatchers(matchers []*labels.Matcher, mint, maxt int64, hints storage.Se
 	writeString(sb, hints.Func)
 	writeString(sb, strings.Join(hints.Grouping, ";"))
 	writeBool(sb, hints.By)
+	writeString(sb, strings.Join(hints.ProjectionLabels, ";"))
+	writeBool(sb, hints.ProjectionInclude)
 
 	key := sb.Sum64()
 	return key

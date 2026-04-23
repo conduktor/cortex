@@ -1,5 +1,4 @@
 //go:build integration_ruler
-// +build integration_ruler
 
 package integration
 
@@ -14,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,13 +27,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore/providers/s3"
-	"gopkg.in/yaml.v3"
 
 	"github.com/cortexproject/cortex/integration/ca"
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/integration/e2ecortex"
 	"github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 )
 
@@ -142,6 +142,65 @@ func TestRulerAPI(t *testing.T) {
 	}
 }
 
+func TestRulerWithUserIndexUpdater(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, rulestoreBucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Configure the ruler.
+	rulerFlags := mergeFlags(
+		BlocksStorageFlags(),
+		RulerFlags(),
+		RulerShardingFlags(consul.NetworkHTTPEndpoint()),
+		map[string]string{
+			"-ruler.sharding-strategy":                                "shuffle-sharding",
+			"-ruler-storage.users-scanner.strategy":                   "user_index",
+			"-ruler-storage.users-scanner.user-index.update-interval": "15s",
+			"-ruler.tenant-shard-size":                                "1",
+			// Since we're not going to run any rule, we don't need the
+			// store-gateway to be configured to a valid address.
+			"-querier.store-gateway-addresses": "localhost:12345",
+			// Enable the bucket index so we can skip the initial bucket scan.
+			"-blocks-storage.bucket-store.bucket-index.enabled": "true",
+			"-ruler.poll-interval":                              "2s",
+			"-log.level":                                        "info",
+		},
+	)
+
+	ruler := e2ecortex.NewRuler(
+		"ruler",
+		consul.NetworkHTTPEndpoint(),
+		rulerFlags,
+		"",
+	)
+
+	require.NoError(t, s.StartAndWaitReady(ruler))
+
+	// Create a client with the ruler address configured
+	c, err := e2ecortex.NewClient("", "", "", ruler.HTTPEndpoint(), "user-1")
+	require.NoError(t, err)
+
+	ruleGroup := createTestRuleGroup(t)
+	ns := "ns"
+
+	// Set the rule group into the ruler
+	require.NoError(t, c.SetRuleGroup(ruleGroup, ns))
+
+	// To make sure user index file is updated/scanned
+	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Greater(float64(0)), []string{"cortex_user_index_last_successful_update_timestamp_seconds"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "component", "ruler")),
+	))
+
+	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(float64(1)), []string{"cortex_user_index_scan_succeeded_total"},
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "component", "ruler")),
+	))
+}
+
 func TestRulerAPISingleBinary(t *testing.T) {
 	s, err := e2e.NewScenario(networkName)
 	require.NoError(t, err)
@@ -215,20 +274,15 @@ func TestRulerSharding(t *testing.T) {
 	ruleGroups := make([]rulefmt.RuleGroup, numRulesGroups)
 	expectedNames := make([]string, numRulesGroups)
 	for i := 0; i < numRulesGroups; i++ {
-		var recordNode yaml.Node
-		var exprNode yaml.Node
-
-		recordNode.SetString(fmt.Sprintf("rule_%d", i))
-		exprNode.SetString(strconv.Itoa(i))
 		ruleName := fmt.Sprintf("test_%d", i)
 
 		expectedNames[i] = ruleName
 		ruleGroups[i] = rulefmt.RuleGroup{
 			Name:     ruleName,
 			Interval: 60,
-			Rules: []rulefmt.RuleNode{{
-				Record: recordNode,
-				Expr:   exprNode,
+			Rules: []rulefmt.Rule{{
+				Record: fmt.Sprintf("rule_%d", i),
+				Expr:   strconv.Itoa(i),
 			}},
 		}
 	}
@@ -278,7 +332,7 @@ func TestRulerSharding(t *testing.T) {
 	require.NoError(t, ruler2.WaitSumMetrics(e2e.Equals(numRulesGroups), "cortex_ruler_rule_groups_in_store"))
 
 	// Fetch the rules and ensure they match the configured ones.
-	actualGroups, err := c.GetPrometheusRules(e2ecortex.DefaultFilter)
+	actualGroups, _, err := c.GetPrometheusRules(e2ecortex.DefaultFilter)
 	require.NoError(t, err)
 
 	var actualNames []string
@@ -309,34 +363,42 @@ func testRulerAPIWithSharding(t *testing.T, enableRulesBackup bool) {
 	expectedNames := make([]string, numRulesGroups)
 	alertCount := 0
 	evalInterval, _ := model.ParseDuration("1s")
+	groupLabels := map[string]string{
+		"group_label_1":   "val1",
+		"group_label_2":   "val2",
+		"duplicate_label": "group_val",
+	}
+	ruleLabels := map[string]string{
+		"rule_label_1":    "val1",
+		"rule_label_2":    "val2",
+		"duplicate_label": "rule_val",
+	}
 	for i := 0; i < numRulesGroups; i++ {
 		num := random.Intn(100)
-		var ruleNode yaml.Node
-		var exprNode yaml.Node
-
-		ruleNode.SetString(fmt.Sprintf("rule_%d", i))
-		exprNode.SetString(strconv.Itoa(i))
 		ruleName := fmt.Sprintf("test_%d", i)
-
 		expectedNames[i] = ruleName
 		if num%2 == 0 {
 			alertCount++
 			ruleGroups[i] = rulefmt.RuleGroup{
 				Name:     ruleName,
 				Interval: evalInterval,
-				Rules: []rulefmt.RuleNode{{
-					Alert: ruleNode,
-					Expr:  exprNode,
+				Rules: []rulefmt.Rule{{
+					Alert:  fmt.Sprintf("rule_%d", i),
+					Expr:   strconv.Itoa(i),
+					Labels: ruleLabels,
 				}},
+				Labels: groupLabels,
 			}
 		} else {
 			ruleGroups[i] = rulefmt.RuleGroup{
 				Name:     ruleName,
 				Interval: evalInterval,
-				Rules: []rulefmt.RuleNode{{
-					Record: ruleNode,
-					Expr:   exprNode,
+				Rules: []rulefmt.Rule{{
+					Record: fmt.Sprintf("rule_%d", i),
+					Labels: ruleLabels,
+					Expr:   strconv.Itoa(i),
 				}},
+				Labels: groupLabels,
 			}
 		}
 	}
@@ -485,6 +547,32 @@ func testRulerAPIWithSharding(t *testing.T, enableRulesBackup bool) {
 				assert.Greater(t, alertsCount, 0, "Expected greater than 0 alerts but got %d", alertsCount)
 			},
 		},
+		"Filter Rules and verify Group Labels exist": {
+			filter: e2ecortex.RuleFilter{
+				RuleType: "alert",
+			},
+			resultCheckFn: func(t assert.TestingT, ruleGroups []*ruler.RuleGroup) {
+				for _, ruleGroup := range ruleGroups {
+					rule := ruleGroup.Rules[0].(map[string]interface{})
+					ruleType := rule["type"]
+					assert.Equal(t, "alerting", ruleType, "Expected 'alerting' rule type but got %s", ruleType)
+					responseJson, err := json.Marshal(rule)
+					assert.NoError(t, err)
+					ar := &alertingRule{}
+					assert.NoError(t, json.Unmarshal(responseJson, ar))
+					if !ar.LastEvaluation.IsZero() {
+						// Labels will be merged only if groups are loaded to Prometheus rule manager
+						assert.Equal(t, 5, ar.Labels.Len())
+					}
+					ar.Labels.Range(func(l labels.Label) {
+						if l.Name == "duplicate_label" {
+							// rule label should override group label
+							assert.Equal(t, ruleLabels["duplicate_label"], l.Value)
+						}
+					})
+				}
+			},
+		},
 	}
 	// For each test case, fetch the rules with configured filters, and ensure the results match.
 	if enableRulesBackup {
@@ -493,9 +581,398 @@ func testRulerAPIWithSharding(t *testing.T, enableRulesBackup bool) {
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			actualGroups, err := c.GetPrometheusRules(tc.filter)
+			actualGroups, _, err := c.GetPrometheusRules(tc.filter)
 			require.NoError(t, err)
 			tc.resultCheckFn(t, actualGroups)
+		})
+	}
+}
+
+func TestRulesPaginationAPISharding(t *testing.T) {
+	testRulesPaginationAPIWithSharding(t, false)
+}
+
+func TestRulesPaginationAPIShardingWithAPIRulesBackupEnabled(t *testing.T) {
+	testRulesPaginationAPIWithSharding(t, true)
+}
+
+func testRulesPaginationAPIWithSharding(t *testing.T, enableRulesBackup bool) {
+	const numRulesGroups = 100
+
+	random := rand.New(rand.NewSource(time.Now().UnixNano()))
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Generate multiple rule groups, with 1 rule each.
+	ruleGroups := make([]rulefmt.RuleGroup, numRulesGroups)
+	expectedNames := make([]string, numRulesGroups)
+	alertCount := 0
+	evalInterval, _ := model.ParseDuration("1s")
+	for i := 0; i < numRulesGroups; i++ {
+		num := random.Intn(100)
+		ruleName := fmt.Sprintf("test_%d", i)
+
+		expectedNames[i] = ruleName
+		if num%2 == 0 {
+			alertCount++
+			ruleGroups[i] = rulefmt.RuleGroup{
+				Name:     ruleName,
+				Interval: evalInterval,
+				Rules: []rulefmt.Rule{{
+					Alert: fmt.Sprintf("rule_%d", i),
+					Expr:  strconv.Itoa(i),
+				}},
+			}
+		} else {
+			ruleGroups[i] = rulefmt.RuleGroup{
+				Name:     ruleName,
+				Interval: evalInterval,
+				Rules: []rulefmt.Rule{{
+					Record: fmt.Sprintf("rule_%d", i),
+					Expr:   strconv.Itoa(i),
+				}},
+			}
+		}
+	}
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, rulestoreBucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Configure the ruler.
+	overrides := map[string]string{
+		// Since we're not going to run any rule, we don't need the
+		// store-gateway to be configured to a valid address.
+		"-querier.store-gateway-addresses": "localhost:12345",
+		// Enable the bucket index so we can skip the initial bucket scan.
+		"-blocks-storage.bucket-store.bucket-index.enabled": "true",
+		"-ruler.poll-interval":                              "5s",
+	}
+	if enableRulesBackup {
+		overrides["-ruler.ring.replication-factor"] = "2"
+	}
+	rulerFlags := mergeFlags(
+		BlocksStorageFlags(),
+		RulerFlags(),
+		RulerShardingFlags(consul.NetworkHTTPEndpoint()),
+		overrides,
+	)
+
+	// Start rulers.
+	ruler1 := e2ecortex.NewRuler("ruler-1", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler2 := e2ecortex.NewRuler("ruler-2", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler3 := e2ecortex.NewRuler("ruler-3", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	rulers := e2ecortex.NewCompositeCortexService(ruler1, ruler2, ruler3)
+	require.NoError(t, s.StartAndWaitReady(ruler1, ruler2, ruler3))
+
+	// Upload rule groups to one of the rulers.
+	c, err := e2ecortex.NewClient("", "", "", ruler1.HTTPEndpoint(), "user-1")
+	require.NoError(t, err)
+
+	namespaceNames := []string{"test1", "test2", "test3", "test4", "test5"}
+	namespaceNameCount := make([]int, len(namespaceNames))
+	nsRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	ruleGroupToNSMap := map[string]string{}
+	for _, ruleGroup := range ruleGroups {
+		index := nsRand.Intn(len(namespaceNames))
+		namespaceNameCount[index] = namespaceNameCount[index] + 1
+		require.NoError(t, c.SetRuleGroup(ruleGroup, namespaceNames[index]))
+		ruleGroupToNSMap[ruleGroup.Name] = namespaceNames[index]
+	}
+
+	// Wait until rulers have loaded all rules.
+	require.NoError(t, rulers.WaitSumMetricsWithOptions(e2e.Equals(numRulesGroups), []string{"cortex_prometheus_rule_group_rules"}, e2e.WaitMissingMetrics))
+
+	// Since rulers have loaded all rules, we expect that rules have been sharded
+	// between the two rulers.
+	require.NoError(t, ruler1.WaitSumMetrics(e2e.Less(numRulesGroups), "cortex_prometheus_rule_group_rules"))
+	require.NoError(t, ruler2.WaitSumMetrics(e2e.Less(numRulesGroups), "cortex_prometheus_rule_group_rules"))
+
+	testCases := map[string]struct {
+		filter        e2ecortex.RuleFilter
+		resultCheckFn func(assert.TestingT, []*ruler.RuleGroup, string, int)
+		iterations    int
+	}{
+		"List Rule Groups - Equal number of rule groups per page": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 20,
+			},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				assert.Len(t, resultGroups, 20, "Expected %d rules but got %d", 20, len(resultGroups))
+				if iteration < 4 {
+					assert.NotEmpty(t, token)
+					return
+				}
+				assert.Empty(t, token)
+			},
+			iterations: 5,
+		},
+		"List Rule Groups - Last page unequal": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 72,
+			},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				if iteration == 0 {
+					assert.Len(t, resultGroups, 72, "Expected %d rules but got %d", 72, len(resultGroups))
+					assert.NotEmpty(t, token)
+					return
+				}
+				assert.Len(t, resultGroups, 28, "Expected %d rules but got %d", 28, len(resultGroups))
+				assert.Empty(t, token)
+			},
+			iterations: 2,
+		},
+		"List all rule groups": {
+			filter: e2ecortex.RuleFilter{},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				assert.Len(t, resultGroups, 100, "Expected %d rules but got %d", 100, len(resultGroups))
+				assert.Empty(t, token)
+			},
+			iterations: 1,
+		},
+		"List all rule groups - Max Rule Groups > Actual": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 200,
+			},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				assert.Len(t, resultGroups, 100, "Expected %d rules but got %d", 100, len(resultGroups))
+				assert.Empty(t, token)
+			},
+			iterations: 1,
+		},
+	}
+
+	// For each test case, fetch the rules with configured filters, and ensure the results match.
+	if enableRulesBackup {
+		err := ruler2.Kill() // if rules backup is enabled the APIs should be able to handle a ruler going down
+		require.NoError(t, err)
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			filter := tc.filter
+			for i := 0; i < tc.iterations; i++ {
+				actualGroups, token, err := c.GetPrometheusRules(filter)
+				require.NoError(t, err)
+				tc.resultCheckFn(t, actualGroups, token, i)
+				filter.NextToken = token
+			}
+		})
+	}
+}
+
+func TestRulesPaginationAPIWithShardingAndNextToken(t *testing.T) {
+	const numRulesGroups = 100
+
+	random := rand.New(rand.NewSource(time.Now().UnixNano()))
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Generate multiple rule groups, with 1 rule each.
+	ruleGroups := make([]rulefmt.RuleGroup, numRulesGroups)
+	expectedNames := make([]string, numRulesGroups)
+	alertCount := 0
+	evalInterval, _ := model.ParseDuration("1s")
+	for i := 0; i < numRulesGroups; i++ {
+		num := random.Intn(100)
+		ruleName := fmt.Sprintf("test_%d", i)
+
+		expectedNames[i] = ruleName
+		if num%2 == 0 {
+			alertCount++
+			ruleGroups[i] = rulefmt.RuleGroup{
+				Name:     ruleName,
+				Interval: evalInterval,
+				Rules: []rulefmt.Rule{{
+					Alert: fmt.Sprintf("rule_%d", i),
+					Expr:  strconv.Itoa(i),
+				}},
+			}
+		} else {
+			ruleGroups[i] = rulefmt.RuleGroup{
+				Name:     ruleName,
+				Interval: evalInterval,
+				Rules: []rulefmt.Rule{{
+					Record: fmt.Sprintf("rule_%d", i),
+					Expr:   strconv.Itoa(i),
+				}},
+			}
+		}
+	}
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, rulestoreBucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Configure the ruler.
+	overrides := map[string]string{
+		// Since we're not going to run any rule, we don't need the
+		// store-gateway to be configured to a valid address.
+		"-querier.store-gateway-addresses": "localhost:12345",
+		// Enable the bucket index so we can skip the initial bucket scan.
+		"-blocks-storage.bucket-store.bucket-index.enabled": "true",
+		"-ruler.poll-interval":                              "5s",
+	}
+	overrides["-ruler.ring.replication-factor"] = "2"
+
+	rulerFlags := mergeFlags(
+		BlocksStorageFlags(),
+		RulerFlags(),
+		RulerShardingFlags(consul.NetworkHTTPEndpoint()),
+		overrides,
+	)
+
+	// Start rulers.
+	ruler1 := e2ecortex.NewRuler("ruler-1", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler2 := e2ecortex.NewRuler("ruler-2", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler3 := e2ecortex.NewRuler("ruler-3", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	rulers := e2ecortex.NewCompositeCortexService(ruler1, ruler2, ruler3)
+	require.NoError(t, s.StartAndWaitReady(ruler1, ruler2, ruler3))
+
+	// Upload rule groups to one of the rulers.
+	c, err := e2ecortex.NewClient("", "", "", ruler1.HTTPEndpoint(), "user-1")
+	require.NoError(t, err)
+
+	namespaceNames := []string{"test1", "test2", "test3", "test4", "test5"}
+	namespaceNameCount := make([]int, len(namespaceNames))
+	nsRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	groupStateDescs := make([]*ruler.GroupStateDesc, len(ruleGroups))
+
+	for i, ruleGroup := range ruleGroups {
+		index := nsRand.Intn(len(namespaceNames))
+		namespaceNameCount[index] = namespaceNameCount[index] + 1
+		require.NoError(t, c.SetRuleGroup(ruleGroup, namespaceNames[index]))
+		groupStateDescs[i] = &ruler.GroupStateDesc{
+			Group: &rulespb.RuleGroupDesc{
+				Name:      ruleGroup.Name,
+				Namespace: namespaceNames[index],
+			},
+		}
+	}
+
+	sort.Sort(ruler.PaginatedGroupStates(groupStateDescs))
+
+	// Wait until rulers have loaded all rules.
+	require.NoError(t, rulers.WaitSumMetricsWithOptions(e2e.Equals(numRulesGroups), []string{"cortex_prometheus_rule_group_rules"}, e2e.WaitMissingMetrics))
+
+	// Since rulers have loaded all rules, we expect that rules have been sharded
+	// between the two rulers.
+	require.NoError(t, ruler1.WaitSumMetrics(e2e.Less(numRulesGroups), "cortex_prometheus_rule_group_rules"))
+	require.NoError(t, ruler2.WaitSumMetrics(e2e.Less(numRulesGroups), "cortex_prometheus_rule_group_rules"))
+
+	testCases := map[string]struct {
+		filter        e2ecortex.RuleFilter
+		resultCheckFn func(assert.TestingT, []*ruler.RuleGroup, string, int)
+		iterations    int
+		tokens        []string
+	}{
+		"List Rule Groups - Equal number of rule groups per page": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 20,
+			},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				assert.Len(t, resultGroups, 20, "Expected %d rules but got %d", 20, len(resultGroups))
+			},
+			iterations: 5,
+			tokens: []string{
+				ruler.GetRuleGroupNextToken(groupStateDescs[19].Group.Namespace, groupStateDescs[19].Group.Name),
+				ruler.GetRuleGroupNextToken(groupStateDescs[39].Group.Namespace, groupStateDescs[39].Group.Name),
+				ruler.GetRuleGroupNextToken(groupStateDescs[59].Group.Namespace, groupStateDescs[59].Group.Name),
+				ruler.GetRuleGroupNextToken(groupStateDescs[79].Group.Namespace, groupStateDescs[79].Group.Name),
+				"",
+			},
+		},
+		"List Rule Groups - Retrieve page 2 and 3": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 20,
+				NextToken:    ruler.GetRuleGroupNextToken(groupStateDescs[19].Group.Namespace, groupStateDescs[19].Group.Name),
+			},
+			resultCheckFn: func(t assert.TestingT, resultGroups []*ruler.RuleGroup, token string, iteration int) {
+				assert.Len(t, resultGroups, 20, "Expected %d rules but got %d", 20, len(resultGroups))
+			},
+			iterations: 2,
+			tokens: []string{
+				ruler.GetRuleGroupNextToken(groupStateDescs[39].Group.Namespace, groupStateDescs[39].Group.Name),
+				ruler.GetRuleGroupNextToken(groupStateDescs[59].Group.Namespace, groupStateDescs[59].Group.Name),
+			},
+		},
+	}
+
+	// For each test case, fetch the rules with configured filters, and ensure the results match.
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			filter := tc.filter
+			for i := 0; i < tc.iterations; i++ {
+				actualGroups, token, err := c.GetPrometheusRules(filter)
+				require.NoError(t, err)
+				tc.resultCheckFn(t, actualGroups, token, i)
+				require.Equal(t, tc.tokens[i], token)
+				filter.NextToken = token
+			}
+		})
+	}
+}
+
+func TestRulesAPIWithNoRules(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, rulestoreBucketName)
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Configure the ruler.
+	overrides := map[string]string{
+		// Since we're not going to run any rule, we don't need the
+		// store-gateway to be configured to a valid address.
+		"-querier.store-gateway-addresses": "localhost:12345",
+		// Enable the bucket index so we can skip the initial bucket scan.
+		"-blocks-storage.bucket-store.bucket-index.enabled": "true",
+		"-ruler.poll-interval":                              "5s",
+	}
+
+	rulerFlags := mergeFlags(
+		BlocksStorageFlags(),
+		RulerFlags(),
+		RulerShardingFlags(consul.NetworkHTTPEndpoint()),
+		overrides,
+	)
+
+	// Start rulers.
+	ruler1 := e2ecortex.NewRuler("ruler-1", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler2 := e2ecortex.NewRuler("ruler-2", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	ruler3 := e2ecortex.NewRuler("ruler-3", consul.NetworkHTTPEndpoint(), rulerFlags, "")
+	require.NoError(t, s.StartAndWaitReady(ruler1, ruler2, ruler3))
+
+	time.Sleep(5 * time.Second)
+	c, err := e2ecortex.NewClient("", "", "", ruler1.HTTPEndpoint(), "user-1")
+	require.NoError(t, err)
+
+	testCases := map[string]struct {
+		filter e2ecortex.RuleFilter
+	}{
+		"List Rule Groups With Filter": {
+			filter: e2ecortex.RuleFilter{
+				MaxRuleGroup: 20,
+			},
+		},
+		"List All Rule Groups With No Filter": {
+			filter: e2ecortex.RuleFilter{},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			actualGroups, token, err := c.GetPrometheusRules(tc.filter)
+			require.NoError(t, err)
+			assert.Empty(t, actualGroups)
+			assert.Empty(t, token)
 		})
 	}
 }
@@ -797,8 +1274,8 @@ func TestRulerMetricsWhenIngesterFails(t *testing.T) {
 
 			// Very low limit so that ruler hits it.
 			"-querier.max-fetched-chunks-per-query": "15",
-			"-querier.query-store-after":            (1 * time.Second).String(),
-			"-querier.query-ingesters-within":       (2 * time.Second).String(),
+			"-limits.query-store-after":             (1 * time.Second).String(),
+			"-limits.query-ingesters-within":        (2 * time.Second).String(),
 		},
 	)
 
@@ -901,8 +1378,8 @@ func TestRulerDisablesRuleGroups(t *testing.T) {
 
 			// Very low limit so that ruler hits it.
 			"-querier.max-fetched-chunks-per-query": "15",
-			"-querier.query-store-after":            (1 * time.Second).String(),
-			"-querier.query-ingesters-within":       (2 * time.Second).String(),
+			"-limits.query-store-after":             (1 * time.Second).String(),
+			"-limits.query-ingesters-within":        (2 * time.Second).String(),
 		},
 	)
 
@@ -933,7 +1410,7 @@ func TestRulerDisablesRuleGroups(t *testing.T) {
 		Bucket:    bucketName,
 		AccessKey: e2edb.MinioAccessKey,
 		SecretKey: e2edb.MinioSecretKey,
-	}, "runtime-config-test")
+	}, "runtime-config-test", nil)
 
 	require.NoError(t, err)
 
@@ -979,7 +1456,7 @@ func TestRulerDisablesRuleGroups(t *testing.T) {
 		require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_prometheus_rule_group_rules"}, e2e.WithLabelMatchers(m1), e2e.WaitMissingMetrics))
 
 		filter := e2ecortex.RuleFilter{}
-		actualGroups, err := c.GetPrometheusRules(filter)
+		actualGroups, _, err := c.GetPrometheusRules(filter)
 		require.NoError(t, err)
 		assert.Equal(t, 1, len(actualGroups))
 		assert.Equal(t, "good_rule", actualGroups[0].Name)
@@ -1001,11 +1478,6 @@ func TestRulerHAEvaluation(t *testing.T) {
 	evalInterval, _ := model.ParseDuration("2s")
 	for i := 0; i < numRulesGroups; i++ {
 		num := random.Intn(10)
-		var ruleNode yaml.Node
-		var exprNode yaml.Node
-
-		ruleNode.SetString(fmt.Sprintf("rule_%d", i))
-		exprNode.SetString(strconv.Itoa(i))
 		ruleName := fmt.Sprintf("test_%d", i)
 
 		expectedNames[i] = ruleName
@@ -1014,18 +1486,18 @@ func TestRulerHAEvaluation(t *testing.T) {
 			ruleGroups[i] = rulefmt.RuleGroup{
 				Name:     ruleName,
 				Interval: evalInterval,
-				Rules: []rulefmt.RuleNode{{
-					Alert: ruleNode,
-					Expr:  exprNode,
+				Rules: []rulefmt.Rule{{
+					Alert: fmt.Sprintf("rule_%d", i),
+					Expr:  strconv.Itoa(i),
 				}},
 			}
 		} else {
 			ruleGroups[i] = rulefmt.RuleGroup{
 				Name:     ruleName,
 				Interval: evalInterval,
-				Rules: []rulefmt.RuleNode{{
-					Record: ruleNode,
-					Expr:   exprNode,
+				Rules: []rulefmt.Rule{{
+					Record: fmt.Sprintf("rule_%d", i),
+					Expr:   strconv.Itoa(i),
 				}},
 			}
 		}
@@ -1125,7 +1597,7 @@ func TestRulerHAEvaluation(t *testing.T) {
 	// assumes ownership, it might not immediately evaluate until it's time to evaluate. The following sleep is to ensure the
 	// rulers have evaluated the rule groups
 	time.Sleep(2100 * time.Millisecond)
-	results, err := c.GetPrometheusRules(e2ecortex.RuleFilter{})
+	results, _, err := c.GetPrometheusRules(e2ecortex.RuleFilter{})
 	require.NoError(t, err)
 	require.Equal(t, numRulesGroups, len(results))
 	for _, v := range results {
@@ -1199,7 +1671,7 @@ func TestRulerKeepFiring(t *testing.T) {
 	// Wait until rule group has tried to evaluate the rule.
 	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_prometheus_rule_evaluations_total"}, e2e.WithLabelMatchers(m), e2e.WaitMissingMetrics))
 
-	groups, err := c.GetPrometheusRules(e2ecortex.RuleFilter{
+	groups, _, err := c.GetPrometheusRules(e2ecortex.RuleFilter{
 		RuleNames: []string{ruleName},
 	})
 	require.NoError(t, err)
@@ -1216,7 +1688,7 @@ func TestRulerKeepFiring(t *testing.T) {
 	// Wait until rule group has tried to evaluate the rule.
 	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(5), []string{"cortex_prometheus_rule_evaluations_total"}, e2e.WithLabelMatchers(m), e2e.WaitMissingMetrics))
 
-	updatedGroups, err := c.GetPrometheusRules(e2ecortex.RuleFilter{
+	updatedGroups, _, err := c.GetPrometheusRules(e2ecortex.RuleFilter{
 		RuleNames: []string{ruleName},
 	})
 	require.NoError(t, err)
@@ -1231,7 +1703,7 @@ func TestRulerKeepFiring(t *testing.T) {
 	require.Greater(t, alert.Alerts[0].KeepFiringSince.UnixNano(), ts.UnixNano(), "KeepFiringSince value should be after expression is resolved")
 
 	time.Sleep(10 * time.Second) // Sleep beyond keepFiringFor time
-	updatedGroups, err = c.GetPrometheusRules(e2ecortex.RuleFilter{
+	updatedGroups, _, err = c.GetPrometheusRules(e2ecortex.RuleFilter{
 		RuleNames: []string{ruleName},
 	})
 	require.NoError(t, err)
@@ -1269,42 +1741,73 @@ func TestRulerEvalWithQueryFrontend(t *testing.T) {
 	distributor := e2ecortex.NewDistributor("distributor", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
 	ingester := e2ecortex.NewIngester("ingester", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), flags, "")
 	require.NoError(t, s.StartAndWaitReady(distributor, ingester))
-	queryFrontend := e2ecortex.NewQueryFrontend("query-frontend", flags, "")
-	require.NoError(t, s.Start(queryFrontend))
+	for _, format := range []string{"protobuf", "json"} {
+		t.Run(fmt.Sprintf("format:%s", format), func(t *testing.T) {
+			queryFrontendFlag := mergeFlags(flags, map[string]string{
+				"-ruler.query-response-format":  format,
+				"-frontend.query-stats-enabled": "true",
+			})
+			queryFrontend := e2ecortex.NewQueryFrontend("query-frontend", queryFrontendFlag, "")
+			require.NoError(t, s.Start(queryFrontend))
 
-	ruler := e2ecortex.NewRuler("ruler", consul.NetworkHTTPEndpoint(), mergeFlags(flags, map[string]string{
-		"-ruler.frontend-address": queryFrontend.NetworkGRPCEndpoint(),
-	}), "")
-	querier := e2ecortex.NewQuerier("querier", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), mergeFlags(flags, map[string]string{
-		"-querier.frontend-address": queryFrontend.NetworkGRPCEndpoint(),
-	}), "")
-	require.NoError(t, s.StartAndWaitReady(ruler, querier))
+			querier := e2ecortex.NewQuerier("querier", e2ecortex.RingStoreConsul, consul.NetworkHTTPEndpoint(), mergeFlags(queryFrontendFlag, map[string]string{
+				"-querier.frontend-address": queryFrontend.NetworkGRPCEndpoint(),
+			}), "")
+			require.NoError(t, s.StartAndWaitReady(querier))
 
-	c, err := e2ecortex.NewClient("", "", "", ruler.HTTPEndpoint(), user)
-	require.NoError(t, err)
+			rulerFlag := mergeFlags(queryFrontendFlag, map[string]string{
+				"-ruler.frontend-address": queryFrontend.NetworkGRPCEndpoint(),
+			})
+			ruler := e2ecortex.NewRuler("ruler", consul.NetworkHTTPEndpoint(), rulerFlag, "")
+			require.NoError(t, s.StartAndWaitReady(ruler))
 
-	expression := "metric"
-	groupName := "rule_group"
-	ruleName := "rule_name"
-	require.NoError(t, c.SetRuleGroup(ruleGroupWithRule(groupName, ruleName, expression), namespace))
+			t.Cleanup(func() {
+				_ = s.Stop(ruler)
+				_ = s.Stop(queryFrontend)
+				_ = s.Stop(querier)
+			})
 
-	rgMatcher := ruleGroupMatcher(user, namespace, groupName)
-	// Wait until ruler has loaded the group.
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_prometheus_rule_group_rules"}, e2e.WithLabelMatchers(rgMatcher), e2e.WaitMissingMetrics))
-	// Wait until rule group has tried to evaluate the rule.
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_prometheus_rule_evaluations_total"}, e2e.WithLabelMatchers(rgMatcher), e2e.WaitMissingMetrics))
+			c, err := e2ecortex.NewClient("", "", "", ruler.HTTPEndpoint(), user)
+			require.NoError(t, err)
 
-	matcher := labels.MustNewMatcher(labels.MatchEqual, "user", user)
-	// Check that cortex_ruler_query_frontend_clients went up
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ruler_query_frontend_clients"}, e2e.WaitMissingMetrics))
-	// Check that cortex_ruler_queries_total went up
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_ruler_queries_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
-	// Check that cortex_ruler_queries_failed_total is zero
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_ruler_queries_failed_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
-	// Check that cortex_ruler_write_requests_total went up
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_ruler_write_requests_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
-	// Check that cortex_ruler_write_requests_failed_total is zero
-	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_ruler_write_requests_failed_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
+			expression := "metric" // vector
+			//expression := "scalar(count(up == 1)) > bool 1" // scalar
+			groupName := "rule_group"
+			ruleName := "rule_name"
+			require.NoError(t, c.SetRuleGroup(ruleGroupWithRule(groupName, ruleName, expression), namespace))
+
+			rgMatcher := ruleGroupMatcher(user, namespace, groupName)
+			// Wait until ruler has loaded the group.
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_prometheus_rule_group_rules"}, e2e.WithLabelMatchers(rgMatcher), e2e.WaitMissingMetrics))
+			// Wait until rule group has tried to evaluate the rule.
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_prometheus_rule_evaluations_total"}, e2e.WithLabelMatchers(rgMatcher), e2e.WaitMissingMetrics))
+			// Make sure not to fail
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_prometheus_rule_evaluation_failures_total"}, e2e.WithLabelMatchers(rgMatcher), e2e.WaitMissingMetrics))
+
+			matcher := labels.MustNewMatcher(labels.MatchEqual, "user", user)
+			sourceMatcher := labels.MustNewMatcher(labels.MatchEqual, "source", "ruler")
+			// Check that cortex_ruler_query_frontend_clients went up
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_ruler_query_frontend_clients"}, e2e.WaitMissingMetrics))
+			// Check that cortex_ruler_queries_total went up
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_ruler_queries_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
+			// Check that cortex_ruler_queries_failed_total is zero
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_ruler_queries_failed_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
+			// Check that cortex_ruler_write_requests_total went up
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_ruler_write_requests_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
+			// Check that cortex_ruler_write_requests_failed_total is zero
+			require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_ruler_write_requests_failed_total"}, e2e.WithLabelMatchers(matcher), e2e.WaitMissingMetrics))
+			// Check that cortex_query_frontend_queries_total went up
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(1), []string{"cortex_query_frontend_queries_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			// check query stat metrics
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_seconds_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_fetched_series_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_samples_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_samples_scanned_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_peak_samples"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_fetched_chunks_bytes_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+			require.NoError(t, queryFrontend.WaitSumMetricsWithOptions(e2e.GreaterOrEqual(0), []string{"cortex_query_fetched_data_bytes_total"}, e2e.WithLabelMatchers(matcher, sourceMatcher), e2e.WaitMissingMetrics))
+		})
+	}
 }
 
 func parseAlertFromRule(t *testing.T, rules interface{}) *alertingRule {
@@ -1349,35 +1852,23 @@ func ruleGroupMatcher(user, namespace, groupName string) *labels.Matcher {
 
 func ruleGroupWithRule(groupName string, ruleName string, expression string) rulefmt.RuleGroup {
 	// Prepare rule group with invalid rule.
-	var recordNode = yaml.Node{}
-	var exprNode = yaml.Node{}
-
-	recordNode.SetString(ruleName)
-	exprNode.SetString(expression)
-
 	return rulefmt.RuleGroup{
 		Name:     groupName,
 		Interval: 10,
-		Rules: []rulefmt.RuleNode{{
-			Record: recordNode,
-			Expr:   exprNode,
+		Rules: []rulefmt.Rule{{
+			Record: ruleName,
+			Expr:   expression,
 		}},
 	}
 }
 
 func alertRuleWithKeepFiringFor(groupName string, ruleName string, expression string, keepFiring model.Duration) rulefmt.RuleGroup {
-	var recordNode = yaml.Node{}
-	var exprNode = yaml.Node{}
-
-	recordNode.SetString(ruleName)
-	exprNode.SetString(expression)
-
 	return rulefmt.RuleGroup{
 		Name:     groupName,
 		Interval: 10,
-		Rules: []rulefmt.RuleNode{{
-			Alert:         recordNode,
-			Expr:          exprNode,
+		Rules: []rulefmt.Rule{{
+			Alert:         ruleName,
+			Expr:          expression,
 			KeepFiringFor: keepFiring,
 		}},
 	}
@@ -1385,21 +1876,13 @@ func alertRuleWithKeepFiringFor(groupName string, ruleName string, expression st
 
 func createTestRuleGroup(t *testing.T) rulefmt.RuleGroup {
 	t.Helper()
-
-	var (
-		recordNode = yaml.Node{}
-		exprNode   = yaml.Node{}
-	)
-
-	recordNode.SetString("test_rule")
-	exprNode.SetString("up")
 	return rulefmt.RuleGroup{
 		Name:     "test_encoded_+\"+group_name/?",
 		Interval: 100,
-		Rules: []rulefmt.RuleNode{
+		Rules: []rulefmt.Rule{
 			{
-				Record: recordNode,
-				Expr:   exprNode,
+				Record: "test_rule",
+				Expr:   "up",
 			},
 		},
 	}

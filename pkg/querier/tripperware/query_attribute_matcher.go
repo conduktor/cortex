@@ -2,13 +2,14 @@ package tripperware
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/httpgrpc"
 
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -17,16 +18,17 @@ import (
 const QueryRejectErrorMessage = "This query does not perform well and has been rejected by the service operator."
 
 func rejectQueryOrSetPriority(r *http.Request, now time.Time, lookbackDelta time.Duration, limits Limits, userStr string, rejectedQueriesPerTenant *prometheus.CounterVec) error {
-	if limits == nil || !(limits.QueryPriority(userStr).Enabled || limits.QueryRejection(userStr).Enabled) {
+	if limits == nil || (!limits.QueryPriority(userStr).Enabled && !limits.QueryRejection(userStr).Enabled) {
 		return nil
 	}
 	op := getOperation(r)
+	reqStats := stats.FromContext(r.Context())
 
 	if op == "query" || op == "query_range" {
 		query := r.FormValue("query")
-		expr, err := parser.ParseExpr(query)
+		expr, err := cortexparser.ParseExpr(query)
 		if err != nil {
-			return httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+			return httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 		}
 		minTime, maxTime := util.FindMinMaxTime(r, expr, lookbackDelta, now)
 
@@ -39,7 +41,6 @@ func rejectQueryOrSetPriority(r *http.Request, now time.Time, lookbackDelta time
 			}
 		}
 
-		reqStats := stats.FromContext(r.Context())
 		reqStats.SetDataSelectMaxTime(maxTime)
 		reqStats.SetDataSelectMinTime(minTime)
 
@@ -54,13 +55,24 @@ func rejectQueryOrSetPriority(r *http.Request, now time.Time, lookbackDelta time
 			}
 			reqStats.SetPriority(queryPriority.DefaultPriority)
 		}
-	}
+	} else {
+		if queryReject := limits.QueryRejection(userStr); queryReject.Enabled && (op == "series" || op == "labels" || op == "label_values") {
+			for _, attribute := range queryReject.QueryAttributes {
+				if matchAttributeForMetadataQuery(attribute, op, r, now) {
+					rejectedQueriesPerTenant.WithLabelValues(op, userStr).Inc()
+					return httpgrpc.Errorf(http.StatusUnprocessableEntity, QueryRejectErrorMessage)
+				}
+			}
+		}
 
-	if queryReject := limits.QueryRejection(userStr); queryReject.Enabled && (op == "series" || op == "labels" || op == "label_values") {
-		for _, attribute := range queryReject.QueryAttributes {
-			if matchAttributeForMetadataQuery(attribute, op, r, now) {
-				rejectedQueriesPerTenant.WithLabelValues(op, userStr).Inc()
-				return httpgrpc.Errorf(http.StatusUnprocessableEntity, QueryRejectErrorMessage)
+		if queryPriority := limits.QueryPriority(userStr); queryPriority.Enabled && len(queryPriority.Priorities) != 0 {
+			for _, priority := range queryPriority.Priorities {
+				for _, attribute := range priority.QueryAttributes {
+					if matchAttributeForMetadataQuery(attribute, op, r, now) {
+						reqStats.SetPriority(priority.Priority)
+						break
+					}
+				}
 			}
 		}
 	}
@@ -80,6 +92,8 @@ func getOperation(r *http.Request) string {
 		return "labels"
 	case strings.HasSuffix(r.URL.Path, "/values"):
 		return "label_values"
+	case strings.HasSuffix(r.URL.Path, "/metadata"):
+		return "metadata"
 	default:
 		return "other"
 	}
@@ -159,13 +173,7 @@ func matchAttributeForMetadataQuery(attribute validation.QueryAttribute, op stri
 	if attribute.Regex != "" {
 		matched = true
 		if attribute.Regex != ".*" && attribute.CompiledRegex != nil {
-			atLeastOneMatched := false
-			for _, matcher := range r.Form["match[]"] {
-				if attribute.CompiledRegex.MatchString(matcher) {
-					atLeastOneMatched = true
-					break
-				}
-			}
+			atLeastOneMatched := slices.ContainsFunc(r.Form["match[]"], attribute.CompiledRegex.MatchString)
 			if !atLeastOneMatched {
 				return false
 			}

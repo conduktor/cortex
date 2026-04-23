@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/server"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/alertmanager/alertstore"
+	"github.com/cortexproject/cortex/pkg/configs"
 	"github.com/cortexproject/cortex/pkg/cortex/storage"
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
 	"github.com/cortexproject/cortex/pkg/ingester"
@@ -35,6 +38,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 func TestCortex(t *testing.T) {
@@ -43,6 +47,7 @@ func TestCortex(t *testing.T) {
 		// these values are set as defaults but since we aren't registering them, we
 		// need to include the defaults here. These were hardcoded in a previous version
 		// of weaveworks server.
+		NameValidationScheme: model.LegacyValidation,
 		Server: server.Config{
 			GRPCListenNetwork: server.DefaultNetwork,
 			HTTPListenNetwork: server.DefaultNetwork,
@@ -84,6 +89,10 @@ func TestCortex(t *testing.T) {
 				IndexCache: tsdb.IndexCacheConfig{
 					Backend: tsdb.IndexCacheBackendInMemory,
 				},
+				BucketStoreType: string(tsdb.TSDBBucketStore),
+			},
+			UsersScanner: users.UsersScannerConfig{
+				Strategy: users.UserScanStrategyList,
 			},
 		},
 		RulerStorage: rulestore.Config{
@@ -165,11 +174,110 @@ func TestConfigValidation(t *testing.T) {
 			},
 			expectedError: errInvalidHTTPPrefix,
 		},
+		{
+			name: "should fail validation for invalid resource to monitor",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Resources: []string{"wrong"},
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("unsupported resource type to monitor: %s", "wrong"),
+		},
+		{
+			name: "should fail validation for invalid resource to monitor - 2",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Interval: -1,
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("resource monitor interval must be greater than zero"),
+		},
+		{
+			name: "should fail validation for invalid resource to monitor - 3",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Interval:        time.Second,
+					CPURateInterval: time.Millisecond,
+				}
+				return configuration
+			},
+			expectedError: fmt.Errorf("resource monitor cpu rate interval cannot be smaller than resource monitor interval"),
+		},
+		{
+			name: "should not fail validation for valid resources to monitor",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.ResourceMonitor = configs.ResourceMonitor{
+					Resources:       []string{"cpu", "heap"},
+					Interval:        time.Second,
+					CPURateInterval: time.Minute,
+				}
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should pass utf8 name validation scheme",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.NameValidationScheme = model.UTF8Validation
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should fail unset name validation scheme",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.NameValidationScheme = model.UnsetValidation
+				return configuration
+			},
+			expectedError: fmt.Errorf("unsupported name validation scheme: unset"),
+		},
+		{
+			name: "should fail when timeout classification is enabled but query stats is disabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = true
+				configuration.Querier.TimeoutClassificationDeadline = time.Minute + 59*time.Second
+				configuration.Querier.TimeoutClassificationEvalThreshold = time.Minute + 30*time.Second
+				configuration.Frontend.Handler.QueryStatsEnabled = false
+				return configuration
+			},
+			expectedError: errTimeoutClassificationRequiresQueryStats,
+		},
+		{
+			name: "should pass when timeout classification is enabled and query stats is enabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = true
+				configuration.Querier.TimeoutClassificationDeadline = time.Minute + 59*time.Second
+				configuration.Querier.TimeoutClassificationEvalThreshold = time.Minute + 30*time.Second
+				configuration.Frontend.Handler.QueryStatsEnabled = true
+				return configuration
+			},
+			expectedError: nil,
+		},
+		{
+			name: "should pass when timeout classification is disabled and query stats is disabled",
+			getTestConfig: func() *Config {
+				configuration := newDefaultConfig()
+				configuration.Querier.TimeoutClassificationEnabled = false
+				configuration.Frontend.Handler.QueryStatsEnabled = false
+				return configuration
+			},
+			expectedError: nil,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.getTestConfig().Validate(nil)
 			if tc.expectedError != nil {
-				require.Equal(t, tc.expectedError, err)
+				require.ErrorContains(t, err, tc.expectedError.Error())
 			} else {
 				require.NoError(t, err)
 			}
@@ -181,9 +289,10 @@ func TestGrpcAuthMiddleware(t *testing.T) {
 	prepareGlobalMetricsRegistry(t)
 
 	cfg := Config{
-		AuthEnabled: true, // We must enable this to enable Auth middleware for gRPC server.
-		Server:      getServerConfig(t),
-		Target:      []string{API}, // Something innocent that doesn't require much config.
+		AuthEnabled:          true, // We must enable this to enable Auth middleware for gRPC server.
+		Server:               getServerConfig(t),
+		Target:               []string{API}, // Something innocent that doesn't require much config.
+		NameValidationScheme: model.LegacyValidation,
 	}
 
 	msch := &mockGrpcServiceHandler{}

@@ -31,9 +31,24 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
-	"github.com/cortexproject/cortex/pkg/tenant"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/util"
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/limiter"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
+	"github.com/cortexproject/cortex/pkg/util/users"
+)
+
+const (
+	opTypeQuery          = "query"
+	opTypeQueryRange     = "query_range"
+	opTypeSeries         = "series"
+	opTypeRemoteRead     = "remote_read"
+	opTypeLabelNames     = "label_names"
+	opTypeLabelValues    = "label_values"
+	opTypeMetadata       = "metadata"
+	opTypeQueryExemplars = "query_exemplars"
+	opTypeFormatQuery    = "format_query"
+	opTypeParseQuery     = "parse_query"
 )
 
 // HandlerFunc is like http.HandlerFunc, but for Handler.
@@ -105,18 +120,19 @@ func NewQueryTripperware(
 	maxSubQuerySteps int64,
 	lookbackDelta time.Duration,
 ) Tripperware {
+
 	// Per tenant query metrics.
 	queriesPerTenant := promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
 		Name: "cortex_query_frontend_queries_total",
 		Help: "Total queries sent per tenant.",
-	}, []string{"op", "user"})
+	}, []string{"op", "source", "user"})
 
 	rejectedQueriesPerTenant := promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
 		Name: "cortex_query_frontend_rejected_queries_total",
 		Help: "Total rejected queries per tenant.",
 	}, []string{"op", "user"})
 
-	activeUsers := util.NewActiveUsersCleanupWithDefaultValues(func(user string) {
+	activeUsers := users.NewActiveUsersCleanupWithDefaultValues(func(user string) {
 		err := util.DeleteMatchingLabels(queriesPerTenant, map[string]string{"user": user})
 		if err != nil {
 			level.Warn(log).Log("msg", "failed to remove cortex_query_frontend_queries_total metric for user", "user", user)
@@ -134,23 +150,53 @@ func NewQueryTripperware(
 				isQuery := strings.HasSuffix(r.URL.Path, "/query")
 				isQueryRange := strings.HasSuffix(r.URL.Path, "/query_range")
 				isSeries := strings.HasSuffix(r.URL.Path, "/series")
+				isRemoteRead := strings.HasSuffix(r.URL.Path, "/read")
+				isLabelNames := strings.HasSuffix(r.URL.Path, "/labels")
+				isLabelValues := strings.HasSuffix(r.URL.Path, "/values")
+				isMetadata := strings.HasSuffix(r.URL.Path, "/metadata")
+				isQueryExemplars := strings.HasSuffix(r.URL.Path, "/query_exemplars")
+				isFormatQuery := strings.HasSuffix(r.URL.Path, "/format_query")
+				isParseQuery := strings.HasSuffix(r.URL.Path, "/parse_query")
 
-				op := "query"
-				if isQueryRange {
-					op = "query_range"
-				} else if isSeries {
-					op = "series"
+				op := opTypeQuery
+				switch {
+				case isQueryRange:
+					op = opTypeQueryRange
+				case isSeries:
+					op = opTypeSeries
+				case isRemoteRead:
+					op = opTypeRemoteRead
+				case isLabelNames:
+					op = opTypeLabelNames
+				case isLabelValues:
+					op = opTypeLabelValues
+				case isMetadata:
+					op = opTypeMetadata
+				case isQueryExemplars:
+					op = opTypeQueryExemplars
+				case isFormatQuery:
+					op = opTypeFormatQuery
+				case isParseQuery:
+					op = opTypeParseQuery
 				}
 
-				tenantIDs, err := tenant.TenantIDs(r.Context())
+				tenantIDs, err := users.TenantIDs(r.Context())
 				// This should never happen anyways because we have auth middleware before this.
 				if err != nil {
-					return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+					return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 				}
 				now := time.Now()
-				userStr := tenant.JoinTenantIDs(tenantIDs)
+				userStr := users.JoinTenantIDs(tenantIDs)
 				activeUsers.UpdateUserTimestamp(userStr, now)
-				queriesPerTenant.WithLabelValues(op, userStr).Inc()
+				source := GetSource(r)
+				queriesPerTenant.WithLabelValues(op, source, userStr).Inc()
+
+				if isQuery || isQueryRange {
+					query := r.FormValue("query")
+					if _, err := cortexparser.ParseExpr(query); err != nil {
+						return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+					}
+				}
 
 				if maxSubQuerySteps > 0 && (isQuery || isQueryRange) {
 					query := r.FormValue("query")
@@ -158,6 +204,16 @@ func NewQueryTripperware(
 					if err := SubQueryStepSizeCheck(query, defaultSubQueryInterval, maxSubQuerySteps); err != nil {
 						return nil, err
 					}
+				}
+
+				var maxResponseSize int64 = 0
+				if limits != nil {
+					maxResponseSize = limits.MaxQueryResponseSize(userStr)
+				}
+				if maxResponseSize > 0 && (isQuery || isQueryRange) {
+					responseSizeLimiter := limiter.NewResponseSizeLimiter(maxResponseSize)
+					context := limiter.AddResponseSizeLimiterToContext(r.Context(), responseSizeLimiter)
+					r = r.WithContext(context)
 				}
 
 				if err := rejectQueryOrSetPriority(r, now, lookbackDelta, limits, userStr, rejectedQueriesPerTenant); err != nil {
@@ -205,7 +261,7 @@ func (q roundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	return q.codec.EncodeResponse(r.Context(), response)
+	return q.codec.EncodeResponse(r.Context(), r, response)
 }
 
 // Do implements Handler.
@@ -215,12 +271,12 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 		return nil, err
 	}
 
-	if headerMap := util_log.HeaderMapFromContext(ctx); headerMap != nil {
-		util_log.InjectHeadersIntoHTTPRequest(headerMap, request)
+	if requestMetadataMap := requestmeta.MapFromContext(ctx); requestMetadataMap != nil {
+		requestmeta.InjectMetadataIntoHTTPRequestHeaders(requestMetadataMap, request)
 	}
 
 	if err := user.InjectOrgIDIntoHTTPRequest(ctx, request); err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	response, err := q.next.RoundTrip(request)
@@ -233,4 +289,15 @@ func (q roundTripper) Do(ctx context.Context, r Request) (Response, error) {
 	}()
 
 	return q.codec.DecodeResponse(ctx, response, r)
+}
+
+func GetSource(r *http.Request) string {
+	// check it for backwards compatibility
+	userAgent := r.Header.Get("User-Agent")
+	if strings.Contains(userAgent, RulerUserAgent) || requestmeta.RequestFromRuler(r.Context()) {
+		// caller is ruler
+		return requestmeta.SourceRuler
+	}
+
+	return requestmeta.SourceAPI
 }

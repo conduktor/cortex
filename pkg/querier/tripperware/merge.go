@@ -3,6 +3,7 @@ package tripperware
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/prometheus/common/model"
@@ -10,6 +11,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/strutil"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 )
 
 const StatusSuccess = "success"
@@ -99,8 +101,8 @@ func MergeResponse(ctx context.Context, sumStats bool, req Request, responses ..
 	res := &PrometheusResponse{
 		Status:   StatusSuccess,
 		Data:     data,
-		Warnings: strutil.MergeUnsortedSlices(warnings...),
-		Infos:    strutil.MergeUnsortedSlices(infos...),
+		Warnings: strutil.MergeUnsortedSlices(0, warnings...),
+		Infos:    strutil.MergeUnsortedSlices(0, infos...),
 	}
 	return res, nil
 }
@@ -135,7 +137,7 @@ func matrixMerge(ctx context.Context, resps []*PrometheusResponse) ([]SampleStre
 }
 
 func vectorMerge(ctx context.Context, req Request, resps []*PrometheusResponse) (*Vector, error) {
-	output := map[string]*Sample{}
+	output := map[string]Sample{}
 	metrics := []string{} // Used to preserve the order for topk and bottomk.
 	sortPlan, err := sortPlanForQuery(req.GetQuery())
 	if err != nil {
@@ -156,9 +158,6 @@ func vectorMerge(ctx context.Context, req Request, resps []*PrometheusResponse) 
 		}
 		for _, sample := range resp.Data.Result.GetVector().Samples {
 			s := sample
-			if s == nil {
-				continue
-			}
 			metric := string(cortexpb.FromLabelAdaptersToLabels(sample.Labels).Bytes(buf))
 			if existingSample, ok := output[metric]; !ok {
 				output[metric] = s
@@ -171,7 +170,7 @@ func vectorMerge(ctx context.Context, req Request, resps []*PrometheusResponse) 
 	}
 
 	result := &Vector{
-		Samples: make([]*Sample, 0, len(output)),
+		Samples: make([]Sample, 0, len(output)),
 	}
 
 	if len(output) == 0 {
@@ -249,7 +248,7 @@ func statsMerge(shouldSumStats bool, resps []*PrometheusResponse) *PrometheusRes
 		keys = append(keys, key)
 	}
 
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	slices.Sort(keys)
 
 	result := &PrometheusResponseStats{Samples: &PrometheusResponseSamplesStats{}}
 	for _, key := range keys {
@@ -272,7 +271,7 @@ const (
 
 type pair struct {
 	metric string
-	s      *Sample
+	s      Sample
 }
 
 // getSortValueFromPair gets the float value used for sorting from samples.
@@ -287,13 +286,13 @@ func getSortValueFromPair(samples []*pair, i int) float64 {
 }
 
 func sortPlanForQuery(q string) (sortPlan, error) {
-	expr, err := promqlparser.ParseExpr(q)
+	expr, err := cortexparser.ParseExpr(q)
 	if err != nil {
 		return 0, err
 	}
-	// Check if the root expression is topk or bottomk
+	// Check if the root expression is topk, bottomk, limitk, or limit_ratio
 	if aggr, ok := expr.(*promqlparser.AggregateExpr); ok {
-		if aggr.Op == promqlparser.TOPK || aggr.Op == promqlparser.BOTTOMK {
+		if aggr.Op == promqlparser.TOPK || aggr.Op == promqlparser.BOTTOMK || aggr.Op == promqlparser.LIMITK || aggr.Op == promqlparser.LIMIT_RATIO {
 			return mergeOnly, nil
 		}
 	}
@@ -304,6 +303,12 @@ func sortPlanForQuery(q string) (sortPlan, error) {
 					sortAsc = true
 				}
 				if n.Func.Name == "sort_desc" {
+					sortDesc = true
+				}
+				if n.Func.Name == "sort_by_label" {
+					sortAsc = true
+				}
+				if n.Func.Name == "sort_by_label_desc" {
 					sortDesc = true
 				}
 			}
@@ -397,7 +402,7 @@ func sliceSamples(samples []cortexpb.Sample, minTs int64) []cortexpb.Sample {
 	return samples[searchResult:]
 }
 
-// sliceHistogram assumes given histogram are sorted by timestamp in ascending order and
+// sliceHistograms assumes given histogram are sorted by timestamp in ascending order and
 // return a sub slice whose first element's is the smallest timestamp that is strictly
 // bigger than the given minTs. Empty slice is returned if minTs is bigger than all the
 // timestamps in histogram.

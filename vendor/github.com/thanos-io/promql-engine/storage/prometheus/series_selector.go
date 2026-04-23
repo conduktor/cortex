@@ -7,10 +7,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/thanos-io/promql-engine/warnings"
+
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
-
-	"github.com/thanos-io/promql-engine/execution/warnings"
 )
 
 type SeriesSelector interface {
@@ -24,10 +24,7 @@ type SignedSeries struct {
 }
 
 type seriesSelector struct {
-	storage  storage.Queryable
-	mint     int64
-	maxt     int64
-	step     int64
+	storage  storage.Querier
 	matchers []*labels.Matcher
 	hints    storage.SelectHints
 
@@ -35,12 +32,9 @@ type seriesSelector struct {
 	series []SignedSeries
 }
 
-func newSeriesSelector(storage storage.Queryable, mint, maxt, step int64, matchers []*labels.Matcher, hints storage.SelectHints) *seriesSelector {
+func newSeriesSelector(storage storage.Querier, matchers []*labels.Matcher, hints storage.SelectHints) *seriesSelector {
 	return &seriesSelector{
 		storage:  storage,
-		maxt:     maxt,
-		mint:     mint,
-		step:     step,
 		matchers: matchers,
 		hints:    hints,
 	}
@@ -61,13 +55,7 @@ func (o *seriesSelector) GetSeries(ctx context.Context, shard int, numShards int
 }
 
 func (o *seriesSelector) loadSeries(ctx context.Context) error {
-	querier, err := o.storage.Querier(o.mint, o.maxt)
-	if err != nil {
-		return err
-	}
-	defer querier.Close()
-
-	seriesSet := querier.Select(ctx, false, &o.hints, o.matchers...)
+	seriesSet := o.storage.Select(ctx, false, &o.hints, o.matchers...)
 	i := 0
 	for seriesSet.Next() {
 		s := seriesSet.At()
@@ -86,10 +74,7 @@ func (o *seriesSelector) loadSeries(ctx context.Context) error {
 
 func seriesShard(series []SignedSeries, index int, numShards int) []SignedSeries {
 	start := index * len(series) / numShards
-	end := (index + 1) * len(series) / numShards
-	if end > len(series) {
-		end = len(series)
-	}
+	end := min((index+1)*len(series)/numShards, len(series))
 
 	slice := series[start:end]
 	shard := make([]SignedSeries, len(slice))

@@ -6,13 +6,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
+	"github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -71,7 +72,6 @@ func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 			req := &tripperware.PrometheusRequest{
@@ -138,7 +138,7 @@ func TestLimitsMiddleware_MaxQueryLength(t *testing.T) {
 			reqStartTime:   now.Add(-time.Hour),
 			reqEndTime:     now,
 			maxQueryLength: thirtyDays,
-			expectedErr:    httpgrpc.Errorf(http.StatusBadRequest, parserErr.Error()).Error(),
+			expectedErr:    httpgrpc.Errorf(http.StatusBadRequest, "%s", parserErr.Error()).Error(),
 		},
 		"should succeed on a query on short time range, ending now": {
 			maxQueryLength: thirtyDays,
@@ -190,7 +190,6 @@ func TestLimitsMiddleware_MaxQueryLength(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 			req := &tripperware.PrometheusRequest{
@@ -233,9 +232,14 @@ func TestLimitsMiddleware_MaxQueryLength(t *testing.T) {
 }
 
 type mockLimits struct {
-	maxQueryLookback  time.Duration
-	maxQueryLength    time.Duration
-	maxCacheFreshness time.Duration
+	maxQueryLookback          time.Duration
+	maxQueryLength            time.Duration
+	maxCacheFreshness         time.Duration
+	maxQueryResponseSize      int64
+	queryVerticalShardSize    int
+	resultsCacheTTL           time.Duration
+	outOfOrderResultsCacheTTL time.Duration
+	outOfOrderWindow          time.Duration
 }
 
 func (m mockLimits) MaxQueryLookback(string) time.Duration {
@@ -254,8 +258,12 @@ func (m mockLimits) MaxCacheFreshness(string) time.Duration {
 	return m.maxCacheFreshness
 }
 
+func (m mockLimits) MaxQueryResponseSize(string) int64 {
+	return m.maxQueryResponseSize
+}
+
 func (m mockLimits) QueryVerticalShardSize(userID string) int {
-	return 0
+	return m.queryVerticalShardSize
 }
 
 func (m mockLimits) QueryPriority(userID string) validation.QueryPriority {
@@ -264,6 +272,18 @@ func (m mockLimits) QueryPriority(userID string) validation.QueryPriority {
 
 func (m mockLimits) QueryRejection(userID string) validation.QueryRejection {
 	return validation.QueryRejection{}
+}
+
+func (m mockLimits) ResultsCacheTTL(userID string) time.Duration {
+	return m.resultsCacheTTL
+}
+
+func (m mockLimits) OutOfOrderResultsCacheTTL(userID string) time.Duration {
+	return m.outOfOrderResultsCacheTTL
+}
+
+func (m mockLimits) OutOfOrderTimeWindow(userID string) model.Duration {
+	return model.Duration(m.outOfOrderWindow)
 }
 
 type mockHandler struct {

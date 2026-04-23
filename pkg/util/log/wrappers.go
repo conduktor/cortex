@@ -8,7 +8,8 @@ import (
 	"github.com/uber/jaeger-client-go"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
+	"github.com/cortexproject/cortex/pkg/util/users"
 )
 
 // WithUserID returns a Logger that has information about the current user in
@@ -43,7 +44,7 @@ func WithContext(ctx context.Context, l log.Logger) log.Logger {
 
 	// Weaveworks uses "orgs" and "orgID" to represent Cortex users,
 	// even though the code-base generally uses `userID` to refer to the same thing.
-	userID, err := tenant.TenantID(ctx)
+	userID, err := users.TenantID(ctx)
 	if err == nil {
 		l = WithUserID(userID, l)
 	}
@@ -64,7 +65,7 @@ func WithSourceIPs(sourceIPs string, l log.Logger) log.Logger {
 
 // HeadersFromContext enables the logging of specified HTTP Headers that have been added to a context
 func HeadersFromContext(ctx context.Context, l log.Logger) log.Logger {
-	headerContentsMap := HeaderMapFromContext(ctx)
+	headerContentsMap := requestmeta.LoggingHeadersAndRequestIdFromContext(ctx)
 	for header, contents := range headerContentsMap {
 		l = log.With(l, header, contents)
 	}

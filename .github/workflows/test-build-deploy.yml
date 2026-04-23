@@ -15,12 +15,12 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     container:
-      image: quay.io/cortexproject/build-image:master-582c03a76
+      image: quay.io/cortexproject/build-image:master-ee0b97cc37
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: Setup Git safe.directory
         run: |
           echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
@@ -38,18 +38,25 @@ jobs:
         run: make BUILD_IN_CONTAINER=false mod-check
       - name: Check Protos
         run: make BUILD_IN_CONTAINER=false check-protos
-      - name: Check Generated Documentation
-        run: make BUILD_IN_CONTAINER=false check-doc
-      - name: Check White Noise.
-        run: make BUILD_IN_CONTAINER=false check-white-noise
+      - name: Check Modernize
+        run: make BUILD_IN_CONTAINER=false check-modernize
 
   test:
-    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-24.04
+          - name: arm64
+            runner: ubuntu-24.04-arm
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     container:
-      image: quay.io/cortexproject/build-image:master-582c03a76
+      image: quay.io/cortexproject/build-image:master-ee0b97cc37
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1 
       - name: Setup Git safe.directory
         run: |
           echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
@@ -62,37 +69,65 @@ jobs:
       - name: Run Tests
         run: make BUILD_IN_CONTAINER=false test
 
+  test-no-race:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-24.04
+          - name: arm64
+            runner: ubuntu-24.04-arm
+    name: test-no-race (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: quay.io/cortexproject/build-image:master-ee0b97cc37
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Setup Git safe.directory
+        run: |
+          echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
+          echo "See https://github.com/actions/runner/issues/2033. We should use --system instead of --global"
+          git config --system --add safe.directory $GITHUB_WORKSPACE
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Run Tests
+        run: make BUILD_IN_CONTAINER=false test-no-race
+
   security:
     name: CodeQL
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
       security-events: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@429e1977040da7a23b6822b13c129cd1ba93dbb2 # v3.26.2
+        uses: github/codeql-action/init@5d4e8d1aca955e8d8589aabd499c5cae939e33c7 # v3.29.5
         with:
           languages: go
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@429e1977040da7a23b6822b13c129cd1ba93dbb2 # v3.26.2
+        uses: github/codeql-action/autobuild@5d4e8d1aca955e8d8589aabd499c5cae939e33c7 # v3.29.5
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@429e1977040da7a23b6822b13c129cd1ba93dbb2 # v3.26.2
+        uses: github/codeql-action/analyze@5d4e8d1aca955e8d8589aabd499c5cae939e33c7 # v3.29.5
 
   
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     container:
-      image: quay.io/cortexproject/build-image:master-582c03a76
+      image: quay.io/cortexproject/build-image:master-ee0b97cc37
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: Setup Git safe.directory
         run: |
           echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
@@ -108,15 +143,6 @@ jobs:
         run: |
           touch build-image/.uptodate
           make BUILD_IN_CONTAINER=false
-      - name: Build Website
-        run: |
-          touch build-image/.uptodate
-          make BUILD_IN_CONTAINER=false web-build
-      - name: Upload Website Artifact
-        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
-        with:
-          name: website public
-          path: website/public/
       - name: Save Images
         run: |
           mkdir /tmp/images
@@ -125,32 +151,86 @@ jobs:
       - name: Create Docker Images Archive
         run: tar -cvf images.tar /tmp/images
       - name: Upload Docker Images Artifact
-        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: Docker Images
           path: ./images.tar
 
   integration:
-    needs: build
-    runs-on: ubuntu-20.04
+    needs: [build, lint]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        tags:
-          - requires_docker
-          - integration_alertmanager
-          - integration_backward_compatibility
-          - integration_memberlist
-          - integration_querier
-          - integration_ruler
-          - integration_query_fuzz
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: requires_docker
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_alertmanager
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_backward_compatibility
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_memberlist
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_overrides
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_querier
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_querier_microservices_mode
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_ruler
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_query_fuzz
+          - runner: ubuntu-24.04
+            arch: amd64
+            tags: integration_remote_write_v2
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: requires_docker
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_alertmanager
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_memberlist
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_overrides
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_ruler
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_remote_write_v2
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_query_fuzz
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_backward_compatibility
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_querier
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            tags: integration_querier_microservices_mode
     steps:
       - name: Upgrade golang
-        uses: actions/setup-go@bfdd3570ce990073878bf10f6b2d79082de49492 # v2.2.0
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
-          go-version: 1.22.5
+          go-version: 1.26.2
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: Install Docker Client
         run: sudo ./.github/workflows/scripts/install-docker.sh
       - name: Sym Link Expected Path to Workspace
@@ -158,7 +238,7 @@ jobs:
           sudo mkdir -p /go/src/github.com/cortexproject/cortex
           sudo ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
       - name: Download Docker Images Artifacts
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: Docker Images
       - name: Extract Docker Images Archive
@@ -176,107 +256,72 @@ jobs:
           docker pull consul:1.8.4
           docker pull gcr.io/etcd-development/etcd:v3.4.7
           if [ "$TEST_TAGS" = "integration_backward_compatibility" ]; then
-            docker pull quay.io/cortexproject/cortex:v1.13.1
-            docker pull quay.io/cortexproject/cortex:v1.13.2
-            docker pull quay.io/cortexproject/cortex:v1.14.0
-            docker pull quay.io/cortexproject/cortex:v1.14.1
-            docker pull quay.io/cortexproject/cortex:v1.15.0
-            docker pull quay.io/cortexproject/cortex:v1.15.1
-            docker pull quay.io/cortexproject/cortex:v1.15.2
-            docker pull quay.io/cortexproject/cortex:v1.15.3
-            docker pull quay.io/cortexproject/cortex:v1.16.0
             docker pull quay.io/cortexproject/cortex:v1.16.1
-            docker pull quay.io/cortexproject/cortex:v1.17.0
-            docker pull quay.io/cortexproject/cortex:v1.17.1
-            docker pull quay.io/cortexproject/cortex:v1.18.0
+            docker pull quay.io/cortexproject/cortex:v1.17.2
+            docker pull quay.io/cortexproject/cortex:v1.18.1
+            docker pull quay.io/cortexproject/cortex:v1.19.1
+            docker pull quay.io/cortexproject/cortex:v1.20.1
+          elif [ "$TEST_TAGS" = "integration_query_fuzz" ]; then
+            docker pull quay.io/cortexproject/cortex:v1.20.1
+            docker pull quay.io/prometheus/prometheus:v3.8.1
           fi
           docker pull memcached:1.6.1
           docker pull redis:7.0.4-alpine
         env:
           TEST_TAGS: ${{ matrix.tags }}
       - name: Integration Tests
+        timeout-minutes: 45
         run: |
           export CORTEX_IMAGE_PREFIX="${IMAGE_PREFIX:-quay.io/cortexproject/}"
           export IMAGE_TAG=$(make image-tag)
-          export CORTEX_IMAGE="${CORTEX_IMAGE_PREFIX}cortex:$IMAGE_TAG-amd64"
+          export CORTEX_IMAGE="${CORTEX_IMAGE_PREFIX}cortex:${IMAGE_TAG}-${{ matrix.arch }}"
           export CORTEX_CHECKOUT_DIR="/go/src/github.com/cortexproject/cortex"
-          echo "Running integration tests with image: $CORTEX_IMAGE"
-          go test -tags=integration,${{ matrix.tags }} -timeout 2400s -v -count=1 ./integration/...
+          echo "Running integration tests on ${{ matrix.arch }} with image: ${CORTEX_IMAGE}"
+          go test -tags=slicelabels,integration,${{ matrix.tags }} -timeout 2400s -v -count=1 ./integration/...
         env:
           IMAGE_PREFIX: ${{ secrets.IMAGE_PREFIX }}
 
   integration-configs-db:
-    needs: build
-    runs-on: ubuntu-20.04
+    needs: [build, lint]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: Install Docker Client
         run: sudo ./.github/workflows/scripts/install-docker.sh
       - name: Download Docker Images Artifact
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: Docker Images
       - name: Extract Docker Images Archive
         run: tar -xvf images.tar -C /
       - name: Run Integration Configs Tests
+        timeout-minutes: 15
         # Github Actions does not support TTY in their default runners yet
         run: |
           touch build-image/.uptodate
           MIGRATIONS_DIR=$(pwd)/cmd/cortex/migrations
-          make BUILD_IMAGE=quay.io/cortexproject/build-image:master-582c03a76 TTY='' configs-integration-test
-
-  deploy_website:
-    needs: [build, test]
-    if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'cortexproject/cortex'
-    runs-on: ubuntu-20.04
-    container:
-      image: quay.io/cortexproject/build-image:master-582c03a76
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
-        with:
-          # web-deploy script expects repo to be cloned with ssh for some commands to work
-          ssh-key: ${{ secrets.WEBSITE_DEPLOY_SSH_PRIVATE_KEY }}
-      - name: Setup Git safe.directory
-        run: |
-          echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
-          echo "See https://github.com/actions/runner/issues/2033. We should use --system instead of --global"
-          git config --system --add safe.directory $GITHUB_WORKSPACE
-      - name: Sym Link Expected Path to Workspace
-        run: |
-          mkdir -p /go/src/github.com/cortexproject/cortex
-          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
-      - name: Download Website Artifact
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: website public
-          path: website/public
-      - name: Setup SSH Keys and known_hosts for Github Authentication to Deploy Website
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
-          ssh-add - <<< "${{ secrets.WEBSITE_DEPLOY_SSH_PRIVATE_KEY }}"
-        env:
-          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
-        shell: bash
-      - name: Deploy Website
-        # SSH is used to authentricate with Github because web-deploy script uses git to checkout and push to gh-pages
-        run: make BUILD_IN_CONTAINER=false web-deploy
-        env:
-          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
-          GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no"
+          echo "Running configs integration tests on ${{ matrix.arch }}"
+          make BUILD_IMAGE=quay.io/cortexproject/build-image:master-ee0b97cc37 TTY='' configs-integration-test
 
   deploy:
     needs: [build, test, lint, integration, integration-configs-db]
     if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'cortexproject/cortex'
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     container:
-      image: quay.io/cortexproject/build-image:master-582c03a76
+      image: quay.io/cortexproject/build-image:master-ee0b97cc37
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: Setup Git safe.directory
         run: |
           echo "this step is needed because when running in container, actions/checkout does not set safe.directory effectively."
@@ -289,7 +334,7 @@ jobs:
           mkdir -p /go/src/github.com/cortexproject/cortex
           ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
       - name: Download Docker Images Artifact
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: Docker Images
       - name: Extract Docker Images Archive

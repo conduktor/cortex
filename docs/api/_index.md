@@ -37,6 +37,8 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Instant query](#instant-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query` |
 | [Range query](#range-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query_range` |
 | [Exemplar query](#exemplar-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/query_exemplars` |
+| [Format query](#format-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/format_query` |
+| [Parse query](#parse-query) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/parse_query` |
 | [Get series by label matchers](#get-series-by-label-matchers) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/series` |
 | [Get label names](#get-label-names) | Querier, Query-frontend || `GET,POST <prometheus-http-prefix>/api/v1/labels` |
 | [Get label values](#get-label-values) | Querier, Query-frontend || `GET <prometheus-http-prefix>/api/v1/label/{name}/values` |
@@ -65,6 +67,9 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager || `DELETE /api/v1/alerts` |
 | [Tenant delete request](#tenant-delete-request) | Purger || `POST /purger/delete_tenant` |
 | [Tenant delete status](#tenant-delete-status) | Purger || `GET /purger/delete_tenant_status` |
+| [Get user overrides](#get-user-overrides) | Overrides || `GET /api/v1/user-overrides` |
+| [Set user overrides](#set-user-overrides) | Overrides || `POST /api/v1/user-overrides` |
+| [Delete user overrides](#delete-user-overrides) | Overrides || `DELETE /api/v1/user-overrides` |
 | [Store-gateway ring status](#store-gateway-ring-status) | Store-gateway || `GET /store-gateway/ring` |
 | [Compactor ring status](#compactor-ring-status) | Compactor || `GET /compactor/ring` |
 | [Get rule files](#get-rule-files) | Configs API (deprecated) || `GET /api/prom/configs/rules` |
@@ -331,6 +336,7 @@ GET,POST <legacy-http-prefix>/api/v1/query
 ```
 
 Prometheus-compatible instant query endpoint.
+PromQL engine can be selected using `X-PromQL-EngineType` header with values `prometheus` (default) and `thanos`.
 
 _For more information, please check out the Prometheus [instant query](https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries) documentation._
 
@@ -346,6 +352,7 @@ GET,POST <legacy-http-prefix>/api/v1/query_range
 ```
 
 Prometheus-compatible range query endpoint. When the request is sent through the query-frontend, the query will be accelerated by query-frontend (results caching and execution parallelisation).
+PromQL engine can be selected using `X-PromQL-EngineType` header with values `prometheus` (default) and `thanos`.
 
 _For more information, please check out the Prometheus [range query](https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries) documentation._
 
@@ -363,6 +370,36 @@ GET,POST <legacy-http-prefix>/api/v1/query_exemplars
 Prometheus-compatible exemplar query endpoint.
 
 _For more information, please check out the Prometheus [exemplar query](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-exemplars) documentation._
+
+_Requires [authentication](#authentication)._
+
+### Format query
+
+```
+GET,POST <prometheus-http-prefix>/api/v1/format_query
+
+# Legacy
+GET,POST <legacy-http-prefix>/api/v1/format_query
+```
+
+Prometheus-compatible format query endpoint. The endpoint formats a PromQL expression in a prettified way.
+
+_For more information, please check out the Prometheus [fomatting query expressions](https://prometheus.io/docs/prometheus/latest/querying/api/#formatting-query-expressions) documentation._
+
+_Requires [authentication](#authentication)._
+
+### Parse query
+
+```
+GET,POST <prometheus-http-prefix>/api/v1/parse_query
+
+# Legacy
+GET,POST <legacy-http-prefix>/api/v1/parse_query
+```
+
+Prometheus-compatible parse query endpoint. This endpoint is **experimental**, it parses a PromQL expression and returns it as a JSON-formatted AST (abstract syntax tree) representation.
+
+_For more information, please check out the Prometheus [Parsing query expressions](https://prometheus.io/docs/prometheus/latest/querying/api/#parsing-a-promql-expressions-into-a-abstract-syntax-tree-ast) documentation._
 
 _Requires [authentication](#authentication)._
 
@@ -390,7 +427,7 @@ GET,POST <prometheus-http-prefix>/api/v1/labels
 GET,POST <legacy-http-prefix>/api/v1/labels
 ```
 
-Get label names of ingested series. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label names from either ingester, store gateway or both.
+Get label names of ingested series. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label names from either ingester, store gateway or both. The special case is that if `start` param is not specified, Cortex currently fetches labels from data stored in the ingesters.
 
 _For more information, please check out the Prometheus [get label names](https://prometheus.io/docs/prometheus/latest/querying/api/#getting-label-names) documentation._
 
@@ -405,7 +442,7 @@ GET <prometheus-http-prefix>/api/v1/label/{name}/values
 GET <legacy-http-prefix>/api/v1/label/{name}/values
 ```
 
-Get label values for a given label name. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label values from either ingester, store gateway or both.
+Get label values for a given label name. Starting from release v1.18.0, Cortex by default honors the `start` and `end` request parameters and fetches label values from either ingester, store gateway or both. The special case is that if `start` param is not specified, Cortex currently fetches label values from data stored in the ingesters.
 
 _For more information, please check out the Prometheus [get label values](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values) documentation._
 
@@ -504,7 +541,7 @@ Prometheus-compatible rules endpoint to list alerting and recording rules that a
 
 _For more information, please check out the Prometheus [rules](https://prometheus.io/docs/prometheus/latest/querying/api/#rules) documentation._
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -521,7 +558,7 @@ Prometheus-compatible rules endpoint to list of all active alerts.
 
 _For more information, please check out the Prometheus [alerts](https://prometheus.io/docs/prometheus/latest/querying/api/#alerts) documentation._
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -536,7 +573,7 @@ GET <legacy-http-prefix>/rules
 
 List all rules configured for the authenticated tenant. This endpoint returns a YAML dictionary with all the rule groups for each namespace and `200` status code on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -595,7 +632,7 @@ GET <legacy-http-prefix>/rules/{namespace}
 
 Returns the rule groups defined for a given namespace.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -627,7 +664,7 @@ GET <legacy-http-prefix>/rules/{namespace}/{groupName}
 
 Returns the rule group matching the request namespace and group name.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -642,7 +679,7 @@ POST <legacy-http-prefix>/rules/{namespace}
 
 Creates or updates a rule group. This endpoint expects a request with `Content-Type: application/yaml` header and the rules **YAML** definition in the request body, and returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -679,7 +716,7 @@ DELETE <legacy-http-prefix>/rules/{namespace}/{groupName}
 
 Deletes a rule group by namespace and group name. This endpoints returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -694,7 +731,7 @@ DELETE <legacy-http-prefix>/rules/{namespace}
 
 Deletes all the rule groups in a namespace (including the namespace itself). This endpoint returns `202` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.ruler.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-ruler.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -706,7 +743,7 @@ POST /ruler/delete_tenant_config
 
 This deletes all rule groups for tenant, and returns `200` on success. Calling endpoint when no rule groups exist for user returns `200`. Authentication is only to identify the tenant.
 
-This is intended as internal API, and not to be exposed to users. This endpoint is enabled regardless of whether `-experimental.ruler.enable-api` is enabled or not.
+This is intended as internal API, and not to be exposed to users. This endpoint is enabled regardless of whether `-ruler.enable-api` is enabled or not.
 
 _Requires [authentication](#authentication)._
 
@@ -759,7 +796,7 @@ POST /multitenant_alertmanager/delete_tenant_config
 ```
 
 This endpoint deletes configuration for a tenant identified by `X-Scope-OrgID` header.
-It is internal, available even if Alertmanager API is not enabled by using `-experimental.alertmanager.enable-api`.
+It is internal, available even if Alertmanager API is not enabled by using `-alertmanager.enable-api`.
 The endpoint returns a status code of `200` if the user's configuration has been deleted, or it didn't exist in the first place.
 
 _Requires [authentication](#authentication)._
@@ -774,7 +811,7 @@ Get the current Alertmanager configuration for the authenticated tenant, reading
 
 This endpoint doesn't accept any URL query parameter and returns `200` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -788,7 +825,7 @@ Stores or updates the Alertmanager configuration for the authenticated tenant. T
 
 This endpoint expects the Alertmanager **YAML** configuration in the request body and returns `201` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -826,7 +863,7 @@ Deletes the Alertmanager configuration for the authenticated tenant.
 
 This endpoint doesn't accept any URL query parameter and returns `200` on success.
 
-_This experimental endpoint is disabled by default and can be enabled via the `-experimental.alertmanager.enable-api` CLI flag (or its respective YAML config option)._
+_This endpoint is disabled by default and can be enabled via the `-alertmanager.enable-api` CLI flag (or its respective YAML config option)._
 
 _Requires [authentication](#authentication)._
 
@@ -853,6 +890,64 @@ GET /purger/delete_tenant_status
 Returns status of tenant deletion. Output format to be defined. Experimental.
 
 _Requires [authentication](#authentication)._
+
+## Overrides
+
+The Overrides service provides an API for managing user overrides.
+
+### Get user overrides
+
+```
+GET /api/v1/user-overrides
+```
+
+Get the current overrides for the authenticated tenant. Returns the overrides in JSON format.
+
+_Requires [authentication](#authentication)._
+
+### Set user overrides
+
+```
+POST /api/v1/user-overrides
+```
+
+Set or update overrides for the authenticated tenant. The request body should contain a JSON object with the override values.
+
+_Requires [authentication](#authentication)._
+
+### Delete user overrides
+
+```
+DELETE /api/v1/user-overrides
+```
+
+Delete all overrides for the authenticated tenant. This will revert the tenant to using default values.
+
+_Requires [authentication](#authentication)._
+
+#### Example request body for PUT
+
+```json
+{
+  "ingestion_rate": 50000,
+  "max_global_series_per_user": 1000000,
+  "ruler_max_rules_per_rule_group": 100
+}
+```
+
+#### Supported limits
+
+The following limits can be modified via the API:
+- `max_global_series_per_user`
+- `max_global_series_per_metric`
+- `ingestion_rate`
+- `ingestion_burst_size`
+- `ruler_max_rules_per_rule_group`
+- `ruler_max_rule_groups_per_tenant`
+
+#### Hard limits
+
+Overrides are validated against hard limits defined in the runtime configuration file. If a requested override exceeds the hard limit for the tenant, the request will be rejected with a 400 status code.
 
 ## Store-gateway
 

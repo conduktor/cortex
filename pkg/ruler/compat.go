@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -15,18 +17,19 @@ import (
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/ring/client"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	promql_util "github.com/cortexproject/cortex/pkg/util/promql"
+	"github.com/cortexproject/cortex/pkg/util/requestmeta"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -46,6 +49,7 @@ type PusherAppender struct {
 	histogramLabels []labels.Labels
 	histograms      []cortexpb.Histogram
 	userID          string
+	opts            *storage.AppendOptions
 }
 
 func (a *PusherAppender) AppendHistogram(_ storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
@@ -70,6 +74,15 @@ func (a *PusherAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v
 	return 0, nil
 }
 
+func (a *PusherAppender) SetOptions(opts *storage.AppendOptions) {
+	a.opts = opts
+}
+
+func (a *PusherAppender) AppendHistogramCTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	// AppendHistogramCTZeroSample is a no-op for PusherAppender as it happens during scrape time only.
+	return 0, nil
+}
+
 func (a *PusherAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
 	// AppendCTZeroSample is a no-op for PusherAppender as it happens during scrape time only.
 	return 0, nil
@@ -84,12 +97,18 @@ func (a *PusherAppender) Commit() error {
 
 	req := cortexpb.ToWriteRequest(a.labels, a.samples, nil, nil, cortexpb.RULE)
 	req.AddHistogramTimeSeries(a.histogramLabels, a.histograms)
+
+	// Set DiscardOutOfOrder flag if requested via AppendOptions
+	if a.opts != nil && a.opts.DiscardOutOfOrder {
+		req.DiscardOutOfOrder = true
+	}
+
 	// Since a.pusher is distributor, client.ReuseSlice will be called in a.pusher.Push.
 	// We shouldn't call client.ReuseSlice here.
 	_, err := a.pusher.Push(user.InjectOrgID(a.ctx, a.userID), req)
 	if err != nil {
 		// Don't report errors that ended with 4xx HTTP status code (series limits, duplicate samples, out of order, etc.)
-		if resp, ok := httpgrpc.HTTPResponseFromError(err); !ok || resp.Code/100 != 4 {
+		if resp, ok := httpgrpc.HTTPResponseFromError(err); !ok || resp.Code/100 == 5 {
 			a.failedWrites.Inc()
 		}
 	}
@@ -148,22 +167,64 @@ func (t *PusherAppendable) Appender(ctx context.Context) storage.Appender {
 // RulesLimits defines limits used by Ruler.
 type RulesLimits interface {
 	MaxQueryLength(userID string) time.Duration
-	RulerTenantShardSize(userID string) int
+	RulerTenantShardSize(userID string) float64
 	RulerMaxRuleGroupsPerTenant(userID string) int
 	RulerMaxRulesPerRuleGroup(userID string) int
 	RulerQueryOffset(userID string) time.Duration
 	DisabledRuleGroups(userID string) validation.DisabledRuleGroups
+	RulerExternalLabels(userID string) labels.Labels
 }
 
-// EngineQueryFunc returns a new engine query function validating max queryLength.
-// Modified from Prometheus rules.EngineQueryFunc
-// https://github.com/prometheus/prometheus/blob/v2.39.1/rules/manager.go#L189.
-func EngineQueryFunc(engine promql.QueryEngine, frontendClient *frontendClient, q storage.Queryable, overrides RulesLimits, userID string, lookbackDelta time.Duration) rules.QueryFunc {
+type QueryExecutor func(ctx context.Context, qs string, t time.Time) (promql.Vector, error)
+
+func engineQueryFunc(engine promql.QueryEngine, frontendClient *frontendClient, q storage.Queryable, overrides RulesLimits, userID string, lookbackDelta time.Duration) rules.QueryFunc {
+	var executor QueryExecutor
+
+	if frontendClient != nil {
+		// query to query frontend
+		executor = frontendClient.InstantQuery
+	} else {
+		// query to engine
+		executor = func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+			return executeQuery(ctx, engine, q, qs, t)
+		}
+	}
+
+	return wrapWithMiddleware(executor, overrides, userID, lookbackDelta)
+}
+
+func executeQuery(ctx context.Context, engine promql.QueryEngine, q storage.Queryable, qs string, t time.Time) (promql.Vector, error) {
+	qry, err := engine.NewInstantQuery(ctx, q, nil, qs, t)
+	if err != nil {
+		return nil, err
+	}
+	defer qry.Close()
+
+	res := qry.Exec(ctx)
+	if res.Err != nil {
+		return nil, res.Err
+	}
+
+	switch v := res.Value.(type) {
+	case promql.Vector:
+		return v, nil
+	case promql.Scalar:
+		return promql.Vector{promql.Sample{
+			T:      v.T,
+			F:      v.V,
+			Metric: labels.Labels{},
+		}}, nil
+	default:
+		return nil, errors.New("rule result is not a vector or scalar")
+	}
+}
+
+func wrapWithMiddleware(next QueryExecutor, overrides RulesLimits, userID string, lookbackDelta time.Duration) rules.QueryFunc {
 	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
 		// Enforce the max query length.
 		maxQueryLength := overrides.MaxQueryLength(userID)
 		if maxQueryLength > 0 {
-			expr, err := parser.ParseExpr(qs)
+			expr, err := cortexparser.ParseExpr(qs)
 			// If failed to parse expression, skip checking select range.
 			// Fail the query in the engine.
 			if err == nil {
@@ -175,39 +236,17 @@ func EngineQueryFunc(engine promql.QueryEngine, frontendClient *frontendClient, 
 			}
 		}
 
-		if frontendClient != nil {
-			v, err := frontendClient.InstantQuery(ctx, qs, t)
-			if err != nil {
-				return nil, err
-			}
-
-			return v, nil
-		} else {
-			q, err := engine.NewInstantQuery(ctx, q, nil, qs, t)
-			if err != nil {
-				return nil, err
-			}
-			res := q.Exec(ctx)
-			if res.Err != nil {
-				return nil, res.Err
-			}
-			switch v := res.Value.(type) {
-			case promql.Vector:
-				return v, nil
-			case promql.Scalar:
-				return promql.Vector{promql.Sample{
-					T:      v.T,
-					F:      v.V,
-					Metric: labels.Labels{},
-				}}, nil
-			default:
-				return nil, errors.New("rule result is not a vector or scalar")
-			}
+		// Add request ID to the context so that it can be used in logs and metrics for split queries.
+		if requestmeta.RequestIdFromContext(ctx) == "" {
+			ctx = requestmeta.ContextWithRequestId(ctx, uuid.NewString())
 		}
+		ctx = requestmeta.ContextWithRequestSource(ctx, requestmeta.SourceRuler)
+
+		return next(ctx, qs, t)
 	}
 }
 
-func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Counter) rules.QueryFunc {
+func metricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Counter) rules.QueryFunc {
 	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
 		queries.Inc()
 		result, err := qf(ctx, qs, t)
@@ -239,7 +278,7 @@ func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Coun
 	}
 }
 
-func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, userID string, evalMetrics *RuleEvalMetrics, logger log.Logger) rules.QueryFunc {
+func recordAndReportRuleQueryMetrics(qf rules.QueryFunc, userID string, evalMetrics *RuleEvalMetrics, logger log.Logger) rules.QueryFunc {
 	queryTime := evalMetrics.RulerQuerySeconds.WithLabelValues(userID)
 	querySeries := evalMetrics.RulerQuerySeries.WithLabelValues(userID)
 	querySample := evalMetrics.RulerQuerySamples.WithLabelValues(userID)
@@ -251,6 +290,9 @@ func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, userID string, evalMetr
 		// If we've been passed a counter we want to record the wall time spent executing this request.
 		timer := prometheus.NewTimer(nil)
 
+		// Add request ID before logging so that it can be used in query stats logs.
+		ctx = requestmeta.ContextWithRequestId(ctx, uuid.NewString())
+
 		defer func() {
 			querySeconds := timer.ObserveDuration().Seconds()
 			queryTime.Add(querySeconds)
@@ -259,12 +301,12 @@ func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, userID string, evalMetr
 			queryChunkBytes.Add(float64(queryStats.FetchedChunkBytes))
 			queryDataBytes.Add(float64(queryStats.FetchedDataBytes))
 			// Log ruler query stats.
-			logMessage := []interface{}{
+			logMessage := []any{
 				"msg", "query stats",
 				"component", "ruler",
 			}
 			if origin := ctx.Value(promql.QueryOrigin{}); origin != nil {
-				queryLabels := origin.(map[string]interface{})
+				queryLabels := origin.(map[string]any)
 				rgMap := queryLabels["ruleGroup"].(map[string]string)
 				logMessage = append(logMessage,
 					"rule_group", rgMap["name"],
@@ -317,38 +359,31 @@ func DefaultTenantManagerFactory(cfg Config, p Pusher, q storage.Queryable, engi
 	// and errors returned by PromQL engine. Errors from Queryable can be either caused by user (limits) or internal errors.
 	// Errors from PromQL are always "user" errors.
 	q = querier.NewErrorTranslateQueryableWithFn(q, WrapQueryableErrors)
-
 	return func(ctx context.Context, userID string, notifier *notifier.Manager, logger log.Logger, frontendPool *client.Pool, reg prometheus.Registerer) (RulesManager, error) {
-		var client *frontendClient
-		failedQueries := evalMetrics.FailedQueriesVec.WithLabelValues(userID)
-		totalQueries := evalMetrics.TotalQueriesVec.WithLabelValues(userID)
-		totalWrites := evalMetrics.TotalWritesVec.WithLabelValues(userID)
-		failedWrites := evalMetrics.FailedWritesVec.WithLabelValues(userID)
+		qfeClient, err := resolveFrontendClient(cfg.FrontendAddress, frontendPool)
+		if err != nil {
+			return nil, err
+		}
 
-		if cfg.FrontendAddress != "" {
-			c, err := frontendPool.GetClientFor(cfg.FrontendAddress)
-			if err != nil {
-				return nil, err
-			}
-			client = c.(*frontendClient)
+		if qfeClient == nil && engine == nil {
+			return nil, fmt.Errorf("neither engine nor frontend client is configured for user %s", userID)
 		}
-		var queryFunc rules.QueryFunc
-		engineQueryFunc := EngineQueryFunc(engine, client, q, overrides, userID, cfg.LookbackDelta)
-		metricsQueryFunc := MetricsQueryFunc(engineQueryFunc, totalQueries, failedQueries)
-		if cfg.EnableQueryStats {
-			queryFunc = RecordAndReportRuleQueryMetrics(metricsQueryFunc, userID, evalMetrics, logger)
-		} else {
-			queryFunc = metricsQueryFunc
-		}
+
+		queryFunc := buildQueryFunc(engine, qfeClient, q, overrides, userID, cfg, evalMetrics, logger)
+		// We let the Prometheus rules manager control the context so that there is a chance
+		// for graceful shutdown of rules that are still in execution even in case the cortex context is canceled.
+		prometheusContext := user.InjectOrgID(context.WithoutCancel(ctx), userID)
 
 		return rules.NewManager(&rules.ManagerOptions{
-			Appendable:             NewPusherAppendable(p, userID, overrides, totalWrites, failedWrites),
+			Appendable: NewPusherAppendable(p, userID, overrides,
+				evalMetrics.TotalWritesVec.WithLabelValues(userID),
+				evalMetrics.FailedWritesVec.WithLabelValues(userID)),
 			Queryable:              q,
 			QueryFunc:              queryFunc,
-			Context:                user.InjectOrgID(ctx, userID),
+			Context:                prometheusContext,
 			ExternalURL:            cfg.ExternalURL.URL,
 			NotifyFunc:             SendAlerts(notifier, cfg.ExternalURL.URL.String()),
-			Logger:                 log.With(logger, "user", userID),
+			Logger:                 util_log.GoKitLogToSlog(log.With(logger, "user", userID)),
 			Registerer:             reg,
 			OutageTolerance:        cfg.OutageTolerance,
 			ForGracePeriod:         cfg.ForGracePeriod,
@@ -358,8 +393,44 @@ func DefaultTenantManagerFactory(cfg Config, p Pusher, q storage.Queryable, engi
 			DefaultRuleQueryOffset: func() time.Duration {
 				return overrides.RulerQueryOffset(userID)
 			},
+			RestoreNewRuleGroups: cfg.EnableSharding,
 		}), nil
 	}
+}
+
+func resolveFrontendClient(addr string, pool *client.Pool) (*frontendClient, error) {
+	if addr == "" {
+		return nil, nil
+	}
+	c, err := pool.GetClientFor(addr)
+	if err != nil {
+		return nil, err
+	}
+	return c.(*frontendClient), nil
+}
+
+func buildQueryFunc(
+	engine promql.QueryEngine,
+	client *frontendClient,
+	q storage.Queryable,
+	overrides RulesLimits,
+	userID string,
+	cfg Config,
+	metrics *RuleEvalMetrics,
+	logger log.Logger,
+) rules.QueryFunc {
+	baseQueryFunc := engineQueryFunc(engine, client, q, overrides, userID, cfg.LookbackDelta)
+
+	// apply metric middleware
+	totalQueries := metrics.TotalQueriesVec.WithLabelValues(userID)
+	failedQueries := metrics.FailedQueriesVec.WithLabelValues(userID)
+	metricsFunc := metricsQueryFunc(baseQueryFunc, totalQueries, failedQueries)
+
+	// apply statistic middleware
+	if cfg.EnableQueryStats {
+		return recordAndReportRuleQueryMetrics(metricsFunc, userID, metrics, logger)
+	}
+	return metricsFunc
 }
 
 type QueryableError struct {

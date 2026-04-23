@@ -27,48 +27,38 @@ Cortex strives to be 100% API compatible with Prometheus (under `/prometheus/*` 
 - Additional API around pushing metrics (under `/api/push`).
 - Additional API endpoints for management of Cortex itself, such as the ring.  These APIs are not part of the any compatibility guarantees.
 
-_For more information, please refer to the [limitations](../guides/limitations.md) doc._
-
 ## Experimental features
 
 Cortex is an actively developed project and we want to encourage the introduction of new features and capability.  As such, not everything in each release of Cortex is considered "production-ready". We don't provide any backwards compatibility guarantees on these and the config and flags might break.
 
 Currently experimental features are:
 
-- Ruler: Evaluate rules to query frontend instead of ingesters (enabled via `-ruler.frontend-address` )
+- Overrides API
+  - Runtime configuration API for managing tenant limits
+- Ruler
+  - Evaluate rules to query frontend instead of ingesters (enabled via `-ruler.frontend-address`).
+  - When `-ruler.frontend-address` is specified, the response format can be specified (via `-ruler.query-response-format`).
 - S3 Server Side Encryption (SSE) using KMS (including per-tenant KMS config overrides).
-- Azure blob storage.
-- Zone awareness based replication.
-- Ruler API (to PUT rules).
 - Alertmanager:
-  - API (enabled via `-experimental.alertmanager.enable-api`)
-  - Sharding of tenants across multiple instances (enabled via `-alertmanager.sharding-enabled`)
   - Receiver integrations firewall (configured via `-alertmanager.receivers-firewall.*`)
-- Memcached client DNS-based service discovery.
-- In-memory (FIFO) and Redis cache.
 - gRPC Store.
 - TLS configuration in gRPC and HTTP clients.
 - TLS configuration in Etcd client.
-- Blocksconvert tools
 - OpenStack Swift storage support.
 - Metric relabeling in the distributor.
-- Scalable query-frontend (when using query-scheduler)
 - Ingester: do not unregister from ring on shutdown (`-ingester.unregister-on-shutdown=false`)
-- Distributor: do not extend writes on unhealthy ingesters (`-distributor.extend-writes=false`)
+- Distributor:
+  - Do not extend writes on unhealthy ingesters (`-distributor.extend-writes=false`)
+  - Accept multiple HA pairs in the same request (enabled via `-experimental.distributor.ha-tracker.mixed-ha-samples=true`)
+  - Accept Prometheus remote write 2.0 request (`-distributor.remote-writev2-enabled=true`)
 - Tenant Deletion in Purger, for blocks storage.
-- Query-frontend: query stats tracking (`-frontend.query-stats-enabled`)
-- Blocks storage bucket index
-  - The bucket index support in the querier and store-gateway (enabled via `-blocks-storage.bucket-store.bucket-index.enabled=true`) is experimental
-  - The block deletion marks migration support in the compactor (`-compactor.block-deletion-marks-migration-enabled`) is temporarily and will be removed in future versions
+- Blocks storage user index
 - Querier: tenant federation
+  - `-tenant-federation.regex-matcher-enabled`
+  - `-tenant-federation.regex-cache-size`
+  - `-tenant-federation.user-sync-interval`
+  - `-tenant-federation.allow-partial-data`
 - The thanosconvert tool for converting Thanos block metadata to Cortex
-- HA Tracker: cleanup of old replicas from KV Store.
-- Instance limits in ingester and distributor
-- Exemplar storage, currently in-memory only within the Ingester based on Prometheus exemplar storage (`-blocks-storage.tsdb.max-exemplars`)
-- Querier limits:
-  - `-querier.max-fetched-chunks-per-query`
-  - `-querier.max-fetched-chunk-bytes-per-query`
-  - `-querier.max-fetched-series-per-query`
 - Alertmanager limits
   - notification rate (`-alertmanager.notification-rate-limit` and `-alertmanager.notification-rate-limit-per-integration`)
   - dispatcher groups (`-alertmanager.max-dispatcher-aggregation-groups`)
@@ -89,8 +79,6 @@ Currently experimental features are:
   - `-alertmanager.sharding-ring.heartbeat-period=0`
   - `-compactor.ring.heartbeat-period=0`
   - `-store-gateway.sharding-ring.heartbeat-period=0`
-- Compactor shuffle sharding
-  - Enabled via `-compactor.sharding-enabled=true`, `-compactor.sharding-strategy=shuffle-sharding`, and `-compactor.tenant-shard-size` set to a value larger than 0.
 - Vertical sharding at query frontend for range/instant queries
   - `-frontend.query-vertical-shard-size` (int) CLI flag
   - `query_vertical_shard_size` (int) field in runtime config file
@@ -108,6 +96,7 @@ Currently experimental features are:
   - `store-gateway.sharding-ring.final-sleep` (duration) CLI flag
   - `alertmanager-sharding-ring.final-sleep` (duration) CLI flag
 - OTLP Receiver
+  - Ingest delta temporality OTLP metrics (`-distributor.otlp.allow-delta-temporality=true`)
 - Persistent tokens in the Ruler Ring:
   - `-ruler.ring.tokens-file-path` (path) CLI flag
 - Native Histograms
@@ -115,3 +104,28 @@ Currently experimental features are:
 - String interning for metrics labels
   - Enable string interning for metrics labels by setting `-ingester.labels-string-interning-enabled` on Ingester.
 - Query-frontend: query rejection (`-frontend.query-rejection.enabled`)
+- Querier: protobuf codec (`-api.querier-default-codec`)
+- Querier: Series batch size (`-querier.store-gateway-series-batch-size`)
+- Query-frontend: dynamic query splits
+  - `querier.max-shards-per-query` (int) CLI flag
+  - `querier.max-fetched-data-duration-per-query` (duration) CLI flag
+- Ingester/Store-Gateway: Query rejection
+  - `-ingester.query-protection.rejection`
+  - `-store-gateway.query-protection.rejection`
+- Distributor/Ingester: Stream push connection
+  - Enable stream push connection between distributor and ingester by setting `-distributor.use-stream-push=true` on Distributor.
+  - Add `__type__` and `__unit__` labels to OTLP and remote write v2 requests (`-distributor.enable-type-and-unit-labels`)
+  - Handle StartTimestampMs (ST) for remote write v2 samples and histograms, using CreatedTimestamp (CT) as a fallback when ST is not set (`-distributor.enable-start-timestamp`)
+- Ingester: Series Queried Metric
+  - Enable on Ingester via `-ingester.active-queried-series-metrics-enabled=true`
+  - Set the time window to expose via metrics using `-ingester.active-queried-series-metrics-windows=2h`. At least 1 time window is required to expose the metric.
+  - `-ingester.active-queried-series-metrics-update-period` metric update interval
+  - `-ingester.active-queried-series-metrics-window-duration` each HyperLogLog time window size
+  - `-ingester.active-queried-series-metrics-sample-rate` query sampling rate
+- Ingester: Regex Matcher Limits
+  - Enable regex matcher limits and metrics collection via `-ingester.enable-regex-matcher-limits=true`
+  - Per-tenant limits for unoptimized regex matchers:
+    - `-validation.max-regex-pattern-length` (int) - maximum pattern length in bytes
+    - `-validation.max-label-cardinality-for-unoptimized-regex` (int) - maximum label cardinality
+    - `-validation.max-total-label-value-length-for-unoptimized-regex` (int) - maximum total length of all label values in bytes
+- HATracker: `-distributor.ha-tracker.enable-startup-sync` (bool) - If enabled, fetches all tracked keys on startup to populate the local cache.

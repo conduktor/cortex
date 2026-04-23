@@ -6,6 +6,7 @@ package compact
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/golang/groupcache/singleflight"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,6 +62,7 @@ type Syncer struct {
 	metrics                  *SyncerMetrics
 	duplicateBlocksFilter    block.DeduplicateFilter
 	ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter
+	syncMetasTimeout         time.Duration
 
 	g singleflight.Group
 }
@@ -101,15 +103,23 @@ func NewSyncerMetrics(reg prometheus.Registerer, blocksMarkedForDeletion, garbag
 
 // NewMetaSyncer returns a new Syncer for the given Bucket and directory.
 // Blocks must be at least as old as the sync delay for being considered.
-func NewMetaSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket, fetcher block.MetadataFetcher, duplicateBlocksFilter block.DeduplicateFilter, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter, blocksMarkedForDeletion, garbageCollectedBlocks prometheus.Counter) (*Syncer, error) {
-	return NewMetaSyncerWithMetrics(logger, NewSyncerMetrics(reg, blocksMarkedForDeletion, garbageCollectedBlocks), bkt, fetcher, duplicateBlocksFilter, ignoreDeletionMarkFilter)
+func NewMetaSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket, fetcher block.MetadataFetcher, duplicateBlocksFilter block.DeduplicateFilter, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter, blocksMarkedForDeletion, garbageCollectedBlocks prometheus.Counter, syncMetasTimeout time.Duration) (*Syncer, error) {
+	return NewMetaSyncerWithMetrics(logger,
+		NewSyncerMetrics(reg, blocksMarkedForDeletion, garbageCollectedBlocks),
+		bkt,
+		fetcher,
+		duplicateBlocksFilter,
+		ignoreDeletionMarkFilter,
+		syncMetasTimeout,
+	)
 }
 
-func NewMetaSyncerWithMetrics(logger log.Logger, metrics *SyncerMetrics, bkt objstore.Bucket, fetcher block.MetadataFetcher, duplicateBlocksFilter block.DeduplicateFilter, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter) (*Syncer, error) {
+func NewMetaSyncerWithMetrics(logger log.Logger, metrics *SyncerMetrics, bkt objstore.Bucket, fetcher block.MetadataFetcher, duplicateBlocksFilter block.DeduplicateFilter, ignoreDeletionMarkFilter *block.IgnoreDeletionMarkFilter, syncMetasTimeout time.Duration) (*Syncer, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 	return &Syncer{
+		syncMetasTimeout:         syncMetasTimeout,
 		logger:                   logger,
 		bkt:                      bkt,
 		fetcher:                  fetcher,
@@ -138,12 +148,18 @@ func UntilNextDownsampling(m *metadata.Meta) (time.Duration, error) {
 
 // SyncMetas synchronizes local state of block metas with what we have in the bucket.
 func (s *Syncer) SyncMetas(ctx context.Context) error {
+	var cancel = func() {}
+	if s.syncMetasTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.syncMetasTimeout)
+	}
+	defer cancel()
+
 	type metasContainer struct {
 		metas   map[ulid.ULID]*metadata.Meta
 		partial map[ulid.ULID]error
 	}
 
-	container, err := s.g.Do("", func() (interface{}, error) {
+	container, err := s.g.Do("", func() (any, error) {
 		metas, partial, err := s.fetcher.Fetch(ctx)
 		return metasContainer{metas, partial}, err
 	})
@@ -171,9 +187,7 @@ func (s *Syncer) Metas() map[ulid.ULID]*metadata.Meta {
 	defer s.mtx.Unlock()
 
 	metas := make(map[ulid.ULID]*metadata.Meta, len(s.blocks))
-	for k, v := range s.blocks {
-		metas[k] = v
-	}
+	maps.Copy(metas, s.blocks)
 
 	return metas
 }
@@ -181,7 +195,9 @@ func (s *Syncer) Metas() map[ulid.ULID]*metadata.Meta {
 // GarbageCollect marks blocks for deletion from bucket if their data is available as part of a
 // block with a higher compaction level.
 // Call to SyncMetas function is required to populate duplicateIDs in duplicateBlocksFilter.
-func (s *Syncer) GarbageCollect(ctx context.Context) error {
+// There is a temporal dependency on deleting marked blocks because otherwise the filters might
+// return inconsistent state if syncing of metas is happening in the background.
+func (s *Syncer) GarbageCollect(ctx context.Context, justDeletedBlocks map[ulid.ULID]struct{}) error {
 	begin := time.Now()
 
 	// Ignore filter exists before deduplicate filter.
@@ -191,10 +207,16 @@ func (s *Syncer) GarbageCollect(ctx context.Context) error {
 	// GarbageIDs contains the duplicateIDs, since these blocks can be replaced with other blocks.
 	// We also remove ids present in deletionMarkMap since these blocks are already marked for deletion.
 	garbageIDs := []ulid.ULID{}
+
 	for _, id := range duplicateIDs {
 		if _, exists := deletionMarkMap[id]; exists {
 			continue
 		}
+
+		if _, exists := justDeletedBlocks[id]; exists {
+			continue
+		}
+
 		garbageIDs = append(garbageIDs, id)
 	}
 
@@ -382,6 +404,31 @@ func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Gro
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Key() < res[j].Key()
 	})
+
+	for _, gr := range groups {
+		var combinedExtensions map[string]any
+		for _, m := range gr.metasByMinTime {
+			ext, ok := m.Thanos.Extensions.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			if combinedExtensions == nil {
+				combinedExtensions = make(map[string]any)
+				maps.Copy(combinedExtensions, ext)
+				continue
+			}
+
+			// Perform logical AND - if the extension exists in all blocks, we keep it.
+			for k := range combinedExtensions {
+				if _, exists := ext[k]; !exists {
+					delete(combinedExtensions, k)
+				}
+			}
+		}
+
+		gr.SetExtensions(combinedExtensions)
+	}
 	return res, nil
 }
 
@@ -473,7 +520,7 @@ func (cg *Group) deleteFromGroup(target map[ulid.ULID]struct{}) {
 	defer cg.mtx.Unlock()
 	var newGroupMeta []*metadata.Meta
 	for _, meta := range cg.metasByMinTime {
-		if _, found := target[meta.BlockMeta.ULID]; !found {
+		if _, found := target[meta.ULID]; !found {
 			newGroupMeta = append(newGroupMeta, meta)
 		}
 	}
@@ -602,7 +649,7 @@ func (ps *CompactionProgressCalculator) ProgressCalculate(ctx context.Context, g
 			if len(g.IDs()) == 1 {
 				continue
 			}
-			plan, err := ps.planner.Plan(ctx, g.metasByMinTime, nil, g.extensions)
+			plan, err := ps.planner.Plan(ctx, g.metasByMinTime, nil, g.Extensions())
 			if err != nil {
 				return errors.Wrapf(err, "could not plan")
 			}
@@ -615,7 +662,7 @@ func (ps *CompactionProgressCalculator) ProgressCalculate(ctx context.Context, g
 			metas := make([]*tsdb.BlockMeta, 0, len(plan))
 			for _, p := range plan {
 				metas = append(metas, &p.BlockMeta)
-				toRemove[p.BlockMeta.ULID] = struct{}{}
+				toRemove[p.ULID] = struct{}{}
 			}
 			g.deleteFromGroup(toRemove)
 
@@ -635,12 +682,12 @@ func (ps *CompactionProgressCalculator) ProgressCalculate(ctx context.Context, g
 		groups = tmpGroups
 	}
 
-	ps.CompactProgressMetrics.NumberOfCompactionRuns.Set(0)
-	ps.CompactProgressMetrics.NumberOfCompactionBlocks.Set(0)
+	ps.NumberOfCompactionRuns.Set(0)
+	ps.NumberOfCompactionBlocks.Set(0)
 
 	for key, iters := range groupCompactions {
-		ps.CompactProgressMetrics.NumberOfCompactionRuns.Add(float64(iters))
-		ps.CompactProgressMetrics.NumberOfCompactionBlocks.Add(float64(groupBlocks[key]))
+		ps.NumberOfCompactionRuns.Add(float64(iters))
+		ps.NumberOfCompactionBlocks.Add(float64(groupBlocks[key]))
 	}
 
 	return nil
@@ -733,9 +780,9 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 		}
 	}
 
-	ds.DownsampleProgressMetrics.NumberOfBlocksDownsampled.Set(0)
+	ds.NumberOfBlocksDownsampled.Set(0)
 	for _, blocks := range groupBlocks {
-		ds.DownsampleProgressMetrics.NumberOfBlocksDownsampled.Add(float64(blocks))
+		ds.NumberOfBlocksDownsampled.Add(float64(blocks))
 	}
 
 	return nil
@@ -782,9 +829,9 @@ func (rs *RetentionProgressCalculator) ProgressCalculate(ctx context.Context, gr
 		}
 	}
 
-	rs.RetentionProgressMetrics.NumberOfBlocksToDelete.Set(0)
+	rs.NumberOfBlocksToDelete.Set(0)
 	for _, blocks := range groupBlocks {
-		rs.RetentionProgressMetrics.NumberOfBlocksToDelete.Add(float64(blocks))
+		rs.NumberOfBlocksToDelete.Add(float64(blocks))
 	}
 
 	return nil
@@ -1134,7 +1181,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 
 	var toCompact []*metadata.Meta
 	if err := tracing.DoInSpanWithErr(ctx, "compaction_planning", func(ctx context.Context) (e error) {
-		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.extensions)
+		toCompact, e = planner.Plan(ctx, cg.metasByMinTime, errChan, cg.Extensions())
 		return e
 	}); err != nil {
 		return false, nil, errors.Wrap(err, "plan compaction")
@@ -1281,7 +1328,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 			Downsample:   metadata.ThanosDownsample{Resolution: cg.resolution},
 			Source:       metadata.CompactorSource,
 			SegmentFiles: block.GetSegmentFiles(bdir),
-			Extensions:   cg.extensions,
+			Extensions:   cg.Extensions(),
 		}
 		if stats.ChunkMaxSize > 0 {
 			thanosMeta.IndexStats.ChunkMaxSize = stats.ChunkMaxSize
@@ -1364,6 +1411,7 @@ type BucketCompactor struct {
 	bkt                            objstore.Bucket
 	concurrency                    int
 	skipBlocksWithOutOfOrderChunks bool
+	blocksCleaner                  *BlocksCleaner
 }
 
 // NewBucketCompactor creates a new bucket compactor.
@@ -1377,6 +1425,7 @@ func NewBucketCompactor(
 	bkt objstore.Bucket,
 	concurrency int,
 	skipBlocksWithOutOfOrderChunks bool,
+	blocksCleaner *BlocksCleaner,
 ) (*BucketCompactor, error) {
 	if concurrency <= 0 {
 		return nil, errors.Errorf("invalid concurrency level (%d), concurrency level must be > 0", concurrency)
@@ -1393,6 +1442,7 @@ func NewBucketCompactor(
 		bkt,
 		concurrency,
 		skipBlocksWithOutOfOrderChunks,
+		blocksCleaner,
 	)
 }
 
@@ -1408,6 +1458,7 @@ func NewBucketCompactorWithCheckerAndCallback(
 	bkt objstore.Bucket,
 	concurrency int,
 	skipBlocksWithOutOfOrderChunks bool,
+	blocksCleaner *BlocksCleaner,
 ) (*BucketCompactor, error) {
 	if concurrency <= 0 {
 		return nil, errors.Errorf("invalid concurrency level (%d), concurrency level must be > 0", concurrency)
@@ -1424,6 +1475,7 @@ func NewBucketCompactorWithCheckerAndCallback(
 		bkt:                            bkt,
 		concurrency:                    concurrency,
 		skipBlocksWithOutOfOrderChunks: skipBlocksWithOutOfOrderChunks,
+		blocksCleaner:                  blocksCleaner,
 	}, nil
 }
 
@@ -1456,9 +1508,7 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 		// Set up workers who will compact the groups when the groups are ready.
 		// They will compact available groups until they encounter an error, after which they will stop.
 		for i := 0; i < c.concurrency; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for g := range groupChan {
 					shouldRerunGroup, _, err := g.Compact(workCtx, c.compactDir, c.planner, c.comp, c.blockDeletableChecker, c.compactionLifecycleCallback)
 					if err == nil {
@@ -1498,18 +1548,27 @@ func (c *BucketCompactor) Compact(ctx context.Context) (rerr error) {
 					errChan <- errors.Wrapf(err, "group %s", g.Key())
 					return
 				}
-			}()
+			})
 		}
 
-		level.Info(c.logger).Log("msg", "start sync of metas")
+		// Blocks that were compacted are garbage collected after each Compaction.
+		// However if compactor crashes we need to resolve those on startup.
+		level.Info(c.logger).Log("msg", "start initial sync of metas")
 		if err := c.sy.SyncMetas(ctx); err != nil {
 			return errors.Wrap(err, "sync")
 		}
 
-		level.Info(c.logger).Log("msg", "start of GC")
-		// Blocks that were compacted are garbage collected after each Compaction.
-		// However if compactor crashes we need to resolve those on startup.
-		if err := c.sy.GarbageCollect(ctx); err != nil {
+		var ignoreBlocks map[ulid.ULID]struct{}
+		if c.blocksCleaner != nil {
+			deletedBlocks, err := c.blocksCleaner.DeleteMarkedBlocks(ctx)
+			if err != nil {
+				return errors.Wrap(err, "cleaning marked blocks")
+			}
+			ignoreBlocks = deletedBlocks
+		}
+
+		level.Info(c.logger).Log("msg", "start of initial garbage collection")
+		if err := c.sy.GarbageCollect(ctx, ignoreBlocks); err != nil {
 			return errors.Wrap(err, "garbage")
 		}
 
@@ -1595,9 +1654,7 @@ func NewGatherNoCompactionMarkFilter(logger log.Logger, bkt objstore.Instrumente
 func (f *GatherNoCompactionMarkFilter) NoCompactMarkedBlocks() map[ulid.ULID]*metadata.NoCompactMark {
 	f.mtx.Lock()
 	copiedNoCompactMarked := make(map[ulid.ULID]*metadata.NoCompactMark, len(f.noCompactMarkedMap))
-	for k, v := range f.noCompactMarkedMap {
-		copiedNoCompactMarked[k] = v
-	}
+	maps.Copy(copiedNoCompactMarked, f.noCompactMarkedMap)
 	f.mtx.Unlock()
 
 	return copiedNoCompactMarked

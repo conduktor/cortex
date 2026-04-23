@@ -7,26 +7,44 @@ import (
 	"context"
 	"math"
 
+	"github.com/thanos-io/promql-engine/execution/exchange"
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/parse"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	"github.com/thanos-io/promql-engine/query"
+	"github.com/thanos-io/promql-engine/warnings"
+
 	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/annotations"
-
-	"github.com/thanos-io/promql-engine/execution/exchange"
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/parse"
-	"github.com/thanos-io/promql-engine/execution/warnings"
-	"github.com/thanos-io/promql-engine/logicalplan"
-	"github.com/thanos-io/promql-engine/query"
 )
 
 type Scanners struct {
 	selectors *SelectorPool
+
+	querier storage.Querier
 }
 
-func NewPrometheusScanners(queryable storage.Queryable) *Scanners {
-	return &Scanners{selectors: NewSelectorPool(queryable)}
+func (s *Scanners) Close() error {
+	return s.querier.Close()
+}
+
+func NewPrometheusScanners(queryable storage.Queryable, qOpts *query.Options, lplan logicalplan.Plan) (*Scanners, error) {
+	var min, max int64
+	if lplan != nil {
+		min, max = lplan.MinMaxTime(qOpts)
+	} else {
+		min, max = qOpts.Start.UnixMilli(), qOpts.End.UnixMilli()
+	}
+
+	querier, err := queryable.Querier(min, max)
+	if err != nil {
+		return nil, errors.Wrap(err, "create querier")
+	}
+	return &Scanners{querier: querier, selectors: NewSelectorPool(querier)}, nil
 }
 
 func (p Scanners) NewVectorSelector(
@@ -35,16 +53,21 @@ func (p Scanners) NewVectorSelector(
 	hints storage.SelectHints,
 	logicalNode logicalplan.VectorSelector,
 ) (model.VectorOperator, error) {
+	// Update hints with projection information if available
+	if logicalNode.Projection != nil {
+		hints.ProjectionLabels = logicalNode.Projection.Labels
+		hints.ProjectionInclude = logicalNode.Projection.Include
+	}
+
 	selector := p.selectors.GetFilteredSelector(hints.Start, hints.End, opts.Step.Milliseconds(), logicalNode.VectorSelector.LabelMatchers, logicalNode.Filters, hints)
 	if logicalNode.DecodeNativeHistogramStats {
 		selector = newHistogramStatsSelector(selector)
 	}
 
 	operators := make([]model.VectorOperator, 0, opts.DecodingConcurrency)
-	for i := 0; i < opts.DecodingConcurrency; i++ {
+	for i := range opts.DecodingConcurrency {
 		operator := exchange.NewConcurrent(
 			NewVectorSelector(
-				model.NewVectorPool(opts.StepsBatch),
 				selector,
 				opts,
 				logicalNode.Offset,
@@ -56,7 +79,7 @@ func (p Scanners) NewVectorSelector(
 		operators = append(operators, operator)
 	}
 
-	return exchange.NewCoalesce(model.NewVectorPool(opts.StepsBatch), opts, logicalNode.BatchSize*int64(opts.DecodingConcurrency), operators...), nil
+	return exchange.NewCoalesce(opts, logicalNode.BatchSize*int64(opts.DecodingConcurrency), operators...), nil
 }
 
 func (p Scanners) NewMatrixSelector(
@@ -67,6 +90,7 @@ func (p Scanners) NewMatrixSelector(
 	call logicalplan.FunctionCall,
 ) (model.VectorOperator, error) {
 	arg := 0.0
+	arg2 := 0.0
 	switch call.Func.Name {
 	case "quantile_over_time":
 		unwrap, err := logicalplan.UnwrapFloat(call.Args[0])
@@ -83,21 +107,42 @@ func (p Scanners) NewMatrixSelector(
 			return nil, errors.Wrapf(parse.ErrNotSupportedExpr, "predict_linear with expression as second argument is not supported")
 		}
 		arg = unwrap
+	case "double_exponential_smoothing":
+		sf, err := logicalplan.UnwrapFloat(call.Args[1])
+		if err != nil {
+			return nil, errors.Wrapf(parse.ErrNotSupportedExpr, "double_exponential_smoothing with expression as second argument is not supported")
+		}
+
+		tf, err := logicalplan.UnwrapFloat(call.Args[2])
+		if err != nil {
+			return nil, errors.Wrapf(parse.ErrNotSupportedExpr, "double_exponential_smoothing with expression as third argument is not supported")
+		}
+
+		if sf <= 0 || sf >= 1 || tf <= 0 || tf >= 1 {
+			return nil, nil
+		}
+		arg = sf
+		arg2 = tf
 	}
 
 	vs := logicalNode.VectorSelector
+	if vs.Projection != nil {
+		hints.ProjectionLabels = vs.Projection.Labels
+		hints.ProjectionInclude = vs.Projection.Include
+	}
+
 	selector := p.selectors.GetFilteredSelector(hints.Start, hints.End, opts.Step.Milliseconds(), vs.LabelMatchers, vs.Filters, hints)
 	if logicalNode.VectorSelector.DecodeNativeHistogramStats {
 		selector = newHistogramStatsSelector(selector)
 	}
 
 	operators := make([]model.VectorOperator, 0, opts.DecodingConcurrency)
-	for i := 0; i < opts.DecodingConcurrency; i++ {
+	for i := range opts.DecodingConcurrency {
 		operator, err := NewMatrixSelector(
-			model.NewVectorPool(opts.StepsBatch),
 			selector,
 			call.Func.Name,
 			arg,
+			arg2,
 			opts,
 			logicalNode.Range,
 			vs.Offset,
@@ -111,7 +156,7 @@ func (p Scanners) NewMatrixSelector(
 		operators = append(operators, exchange.NewConcurrent(operator, 2, opts))
 	}
 
-	return exchange.NewCoalesce(model.NewVectorPool(opts.StepsBatch), opts, vs.BatchSize*int64(opts.DecodingConcurrency), operators...), nil
+	return exchange.NewCoalesce(opts, vs.BatchSize*int64(opts.DecodingConcurrency), operators...), nil
 }
 
 type histogramStatsSelector struct {
@@ -142,5 +187,5 @@ func newHistogramStatsSeries(series storage.Series) histogramStatsSeries {
 }
 
 func (h histogramStatsSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
-	return NewHistogramStatsIterator(h.Series.Iterator(it))
+	return promql.NewHistogramStatsIterator(h.Series.Iterator(it))
 }

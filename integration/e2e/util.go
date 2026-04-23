@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"maps"
 	"math"
 	"math/rand"
 	"net/http"
@@ -12,12 +13,14 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
@@ -60,9 +63,7 @@ func MergeFlagsWithoutRemovingEmpty(inputs ...map[string]string) map[string]stri
 	output := map[string]string{}
 
 	for _, input := range inputs {
-		for name, value := range input {
-			output[name] = value
-		}
+		maps.Copy(output, input)
 	}
 
 	return output
@@ -172,10 +173,10 @@ func GenerateHistogramSeries(name string, ts time.Time, i uint32, floatHistogram
 		ph prompb.Histogram
 	)
 	if floatHistogram {
-		fh = tsdbutil.GenerateTestFloatHistogram(int(i))
+		fh = tsdbutil.GenerateTestFloatHistogram(int64(i))
 		ph = prompb.FromFloatHistogram(tsMillis, fh)
 	} else {
-		h = tsdbutil.GenerateTestHistogram(int(i))
+		h = tsdbutil.GenerateTestHistogram(int64(i))
 		ph = prompb.FromIntHistogram(tsMillis, h)
 	}
 
@@ -208,9 +209,10 @@ func GenerateSeriesWithSamples(
 
 	startTMillis := tsMillis
 	samples := make([]prompb.Sample, numSamples)
-	for i := 0; i < numSamples; i++ {
+	for i := range numSamples {
+		scrapeJitter := rand.Int63n(10) + 1 // add a jitter to simulate real-world scenarios, refer to: https://github.com/prometheus/prometheus/issues/13213
 		samples[i] = prompb.Sample{
-			Timestamp: startTMillis,
+			Timestamp: startTMillis + scrapeJitter,
 			Value:     float64(i + startValue),
 		}
 		startTMillis += durMillis
@@ -257,6 +259,98 @@ func RandRange(rnd *rand.Rand, min, max int64) int64 {
 	return rnd.Int63n(max-min) + min
 }
 
+func CreateNHBlock(
+	ctx context.Context,
+	rnd *rand.Rand,
+	dir string,
+	series []labels.Labels,
+	numNHSamples int,
+	mint, maxt int64,
+	scrapeInterval int64,
+	seriesSize int64,
+) (id ulid.ULID, err error) {
+	headOpts := tsdb.DefaultHeadOptions()
+	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
+	headOpts.ChunkRange = 10000000000
+	random := rand.New(rand.NewSource(time.Now().UnixNano()))
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "create head block")
+	}
+	defer func() {
+		runutil.CloseWithErrCapture(&err, h, "TSDB Head")
+		if e := os.RemoveAll(headOpts.ChunkDirRoot); e != nil {
+			err = errors.Wrap(e, "delete chunks dir")
+		}
+	}()
+
+	app := h.Appender(ctx)
+	for i := range series {
+		num := random.Intn(i + 1)
+		var ref storage.SeriesRef
+		start := RandRange(rnd, mint, maxt)
+		for j := range numNHSamples {
+			switch num % 4 {
+			case 0:
+				// append float histogram
+				ref, err = app.AppendHistogram(ref, series[i], start, nil, tsdbutil.GenerateTestFloatHistogram(int64(i+j)))
+			case 1:
+				// append int histogram
+				ref, err = app.AppendHistogram(ref, series[i], start, tsdbutil.GenerateTestHistogram(int64(i+j)), nil)
+			case 2:
+				// append float histogram with custom bucket
+				ref, err = app.AppendHistogram(ref, series[i], start, nil, tsdbutil.GenerateTestCustomBucketsFloatHistogram(int64(i+j)))
+			case 3:
+				// append int histogram with custom bucket
+				ref, err = app.AppendHistogram(ref, series[i], start, tsdbutil.GenerateTestCustomBucketsHistogram(int64(i+j)), nil)
+			}
+			if err != nil {
+				if rerr := app.Rollback(); rerr != nil {
+					err = errors.Wrapf(err, "rollback failed: %v", rerr)
+				}
+				return id, errors.Wrap(err, "add NH sample")
+			}
+			start += scrapeInterval
+			if start > maxt {
+				break
+			}
+		}
+	}
+	if err := app.Commit(); err != nil {
+		return id, errors.Wrap(err, "commit")
+	}
+
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{maxt - mint}, nil, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "create compactor")
+	}
+
+	ids, err := c.Write(dir, h, mint, maxt, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "write block")
+	}
+	if len(ids) == 0 {
+		return id, errors.Errorf("nothing to write, asked for %d samples", numNHSamples)
+	}
+	id = ids[0]
+
+	blockDir := filepath.Join(dir, id.String())
+	logger := log.NewNopLogger()
+
+	if _, err = metadata.InjectThanos(logger, blockDir, metadata.Thanos{
+		Labels: map[string]string{
+			cortex_tsdb.IngesterIDExternalLabel: "ingester-0",
+		},
+		Downsample: metadata.ThanosDownsample{Resolution: 0},
+		Source:     metadata.TestSource,
+		IndexStats: metadata.IndexStats{SeriesMaxSize: seriesSize},
+	}, nil); err != nil {
+		return id, errors.Wrap(err, "finalize block")
+	}
+
+	return id, nil
+}
+
 func CreateBlock(
 	ctx context.Context,
 	rnd *rand.Rand,
@@ -282,11 +376,11 @@ func CreateBlock(
 	}()
 
 	app := h.Appender(ctx)
-	for i := 0; i < len(series); i++ {
+	for i := range series {
 
 		var ref storage.SeriesRef
 		start := RandRange(rnd, mint, maxt)
-		for j := 0; j < numSamples; j++ {
+		for j := range numSamples {
 			ref, err = app.Append(ref, series[i], start, float64(i+j))
 			if err != nil {
 				if rerr := app.Rollback(); rerr != nil {
@@ -304,7 +398,7 @@ func CreateBlock(
 		return id, errors.Wrap(err, "commit")
 	}
 
-	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, nil)
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{maxt - mint}, nil, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create compactor")
 	}
@@ -333,4 +427,129 @@ func CreateBlock(
 	}
 
 	return id, nil
+}
+
+func GenerateHistogramSeriesV2(name string, ts time.Time, i uint32, customBucket, floatHistogram bool, additionalLabels ...prompb.Label) (symbols []string, series []writev2.TimeSeries) {
+	tsMillis := TimeToMilliseconds(ts)
+
+	st := writev2.NewSymbolTable()
+	lb := labels.NewScratchBuilder(0)
+	lb.Add("__name__", name)
+	for _, lbl := range additionalLabels {
+		lb.Add(lbl.Name, lbl.Value)
+	}
+
+	var (
+		h  *histogram.Histogram
+		fh *histogram.FloatHistogram
+		ph writev2.Histogram
+	)
+
+	if floatHistogram {
+		if customBucket {
+			fh = tsdbutil.GenerateTestCustomBucketsFloatHistogram(int64(i))
+		} else {
+			fh = tsdbutil.GenerateTestFloatHistogram(int64(i))
+		}
+		ph = writev2.FromFloatHistogram(tsMillis, fh)
+	} else {
+		if customBucket {
+			h = tsdbutil.GenerateTestCustomBucketsHistogram(int64(i))
+		} else {
+			h = tsdbutil.GenerateTestHistogram(int64(i))
+		}
+		ph = writev2.FromIntHistogram(tsMillis, h)
+	}
+
+	// Generate the series
+	series = append(series, writev2.TimeSeries{
+		LabelsRefs: st.SymbolizeLabels(lb.Labels(), nil),
+		Histograms: []writev2.Histogram{ph},
+	})
+
+	symbols = st.Symbols()
+
+	return
+}
+
+func GenerateSeriesV2(name string, ts time.Time, additionalLabels ...prompb.Label) (symbols []string, series []writev2.TimeSeries, vector model.Vector) {
+	tsMillis := TimeToMilliseconds(ts)
+	value := rand.Float64()
+
+	st := writev2.NewSymbolTable()
+	lb := labels.NewScratchBuilder(0)
+	lb.Add("__name__", name)
+	for _, label := range additionalLabels {
+		lb.Add(label.Name, label.Value)
+	}
+
+	series = append(series, writev2.TimeSeries{
+		// Generate the series
+		LabelsRefs: st.SymbolizeLabels(lb.Labels(), nil),
+		Samples: []writev2.Sample{
+			{Value: value, Timestamp: tsMillis},
+		},
+		Metadata: writev2.Metadata{
+			Type:    writev2.Metadata_METRIC_TYPE_GAUGE,
+			HelpRef: 2, // equal to name
+			UnitRef: 2, // equal to name
+		},
+	})
+	symbols = st.Symbols()
+
+	// Generate the expected vector when querying it
+	metric := model.Metric{}
+	metric[labels.MetricName] = model.LabelValue(name)
+	for _, lbl := range additionalLabels {
+		metric[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
+	}
+
+	vector = append(vector, &model.Sample{
+		Metric:    metric,
+		Value:     model.SampleValue(value),
+		Timestamp: model.Time(tsMillis),
+	})
+
+	return
+}
+
+func GenerateV2SeriesWithSamples(
+	name string,
+	startTime time.Time,
+	scrapeInterval time.Duration,
+	startValue int,
+	numSamples int,
+	additionalLabels ...prompb.Label,
+) (symbols []string, series writev2.TimeSeries) {
+	tsMillis := TimeToMilliseconds(startTime)
+	durMillis := scrapeInterval.Milliseconds()
+
+	st := writev2.NewSymbolTable()
+	lb := labels.NewScratchBuilder(0)
+	lb.Add("__name__", name)
+
+	for _, label := range additionalLabels {
+		lb.Add(label.Name, label.Value)
+	}
+
+	startTMillis := tsMillis
+	samples := make([]writev2.Sample, numSamples)
+	for i := range numSamples {
+		scrapeJitter := rand.Int63n(10) + 1 // add a jitter to simulate real-world scenarios, refer to: https://github.com/prometheus/prometheus/issues/13213
+		samples[i] = writev2.Sample{
+			Timestamp: startTMillis + scrapeJitter,
+			Value:     float64(i + startValue),
+		}
+		startTMillis += durMillis
+	}
+
+	series = writev2.TimeSeries{
+		LabelsRefs: st.SymbolizeLabels(lb.Labels(), nil),
+		Samples:    samples,
+		Metadata: writev2.Metadata{
+			Type: writev2.Metadata_METRIC_TYPE_GAUGE,
+		},
+	}
+
+	return st.Symbols(), series
 }

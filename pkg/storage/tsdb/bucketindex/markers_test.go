@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +15,7 @@ import (
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
-	cortex_testutil "github.com/cortexproject/cortex/pkg/storage/tsdb/testutil"
+	cortex_testutil "github.com/cortexproject/cortex/pkg/util/testutil"
 )
 
 func TestBlockDeletionMarkFilepath(t *testing.T) {

@@ -36,13 +36,13 @@ func Test_newStoreGatewayClientFactory(t *testing.T) {
 
 	// Create a client factory and query back the mocked service
 	// with different clients.
-	cfg := grpcclient.Config{}
+	cfg := grpcclient.ConfigWithHealthCheck{}
 	flagext.DefaultValues(&cfg)
 
 	reg := prometheus.NewPedanticRegistry()
 	factory := newStoreGatewayClientFactory(cfg, reg)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		client, err := factory(listener.Addr().String())
 		require.NoError(t, err)
 		defer client.Close() //nolint:errcheck

@@ -18,8 +18,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sony/gobreaker"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
-
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // MemcachedClient interface exists for mocking memcacheClient.
@@ -82,7 +80,7 @@ type MemcachedClientConfig struct {
 func (cfg *MemcachedClientConfig) RegisterFlagsWithPrefix(prefix, description string, f *flag.FlagSet) {
 	f.StringVar(&cfg.Host, prefix+"memcached.hostname", "", description+"Hostname for memcached service to use. If empty and if addresses is unset, no memcached will be used.")
 	f.StringVar(&cfg.Service, prefix+"memcached.service", "memcached", description+"SRV service used to discover memcache servers.")
-	f.StringVar(&cfg.Addresses, prefix+"memcached.addresses", "", description+"EXPERIMENTAL: Comma separated addresses list in DNS Service Discovery format: https://cortexmetrics.io/docs/configuration/arguments/#dns-service-discovery")
+	f.StringVar(&cfg.Addresses, prefix+"memcached.addresses", "", description+"Comma separated addresses list in DNS Service Discovery format: https://cortexmetrics.io/docs/configuration/arguments/#dns-service-discovery")
 	f.IntVar(&cfg.MaxIdleConns, prefix+"memcached.max-idle-conns", 16, description+"Maximum number of idle connections in pool.")
 	f.DurationVar(&cfg.Timeout, prefix+"memcached.timeout", 100*time.Millisecond, description+"Maximum time to wait before giving up on memcached requests.")
 	f.DurationVar(&cfg.UpdateInterval, prefix+"memcached.update-interval", 1*time.Minute, description+"Period with which to poll DNS for memcache servers.")
@@ -141,11 +139,10 @@ func NewMemcachedClient(cfg MemcachedClientConfig, name string, r prometheus.Reg
 		}),
 	}
 	if cfg.CBFailures > 0 {
-		newClient.Client.DialContext = newClient.dialViaCircuitBreaker
+		newClient.DialContext = newClient.dialViaCircuitBreaker
 	}
 
 	if len(cfg.Addresses) > 0 {
-		util_log.WarnExperimentalUse("DNS-based memcached service discovery")
 		newClient.addresses = strings.Split(cfg.Addresses, ",")
 	}
 
@@ -180,7 +177,7 @@ func (c *memcachedClient) dialViaCircuitBreaker(_ context.Context, network, addr
 	}
 	c.Unlock()
 
-	conn, err := cb.Execute(func() (interface{}, error) {
+	conn, err := cb.Execute(func() (any, error) {
 		return net.DialTimeout(network, address, c.cbTimeout)
 	})
 	if err != nil {
@@ -243,7 +240,7 @@ func (c *memcachedClient) updateMemcacheServers() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := c.provider.Resolve(ctx, c.addresses); err != nil {
+		if err := c.provider.Resolve(ctx, c.addresses, true); err != nil {
 			return err
 		}
 		servers = c.provider.Addresses()

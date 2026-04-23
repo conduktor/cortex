@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/discovery/cache"
+	"github.com/thanos-io/thanos/pkg/logutil"
 )
 
 // HTTPConfig is a structure that allows pointing to various HTTP endpoint, e.g ruler connecting to queriers.
@@ -289,9 +291,7 @@ func (u userAgentRoundTripper) RoundTrip(r *http.Request) (*http.Response, error
 		r2 := new(http.Request)
 		*r2 = *r
 		r2.Header = make(http.Header)
-		for k, s := range r.Header {
-			r2.Header[k] = s
-		}
+		maps.Copy(r2.Header, r.Header)
 		r2.Header.Set("User-Agent", u.name)
 		r = r2
 	}
@@ -330,7 +330,7 @@ func (c HTTPFileSDConfig) convert() (file.SDConfig, error) {
 }
 
 type AddressProvider interface {
-	Resolve(context.Context, []string) error
+	Resolve(context.Context, []string, bool) error
 	Addresses() []string
 }
 
@@ -363,7 +363,7 @@ func NewClient(logger log.Logger, cfg HTTPEndpointsConfig, client *http.Client, 
 		}
 		// We provide an empty registry and ignore metrics for now.
 		sdReg := prometheus.NewRegistry()
-		fileSD, err := file.NewDiscovery(&fileSDCfg, logger, fileSDCfg.NewDiscovererMetrics(sdReg, discovery.NewRefreshMetrics(sdReg)))
+		fileSD, err := file.NewDiscovery(&fileSDCfg, logutil.GoKitLogToSlog(logger), fileSDCfg.NewDiscovererMetrics(sdReg, discovery.NewRefreshMetrics(sdReg)))
 		if err != nil {
 			return nil, err
 		}
@@ -433,5 +433,5 @@ func (c *HTTPClient) Discover(ctx context.Context) {
 
 // Resolve refreshes and resolves the list of targets.
 func (c *HTTPClient) Resolve(ctx context.Context) error {
-	return c.provider.Resolve(ctx, append(c.fileSDCache.Addresses(), c.staticAddresses...))
+	return c.provider.Resolve(ctx, append(c.fileSDCache.Addresses(), c.staticAddresses...), true)
 }

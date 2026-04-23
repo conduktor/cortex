@@ -5,13 +5,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/httpgrpc"
 
+	cortexparser "github.com/cortexproject/cortex/pkg/parser"
 	"github.com/cortexproject/cortex/pkg/querier/tripperware"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/promql"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
+	"github.com/cortexproject/cortex/pkg/util/users"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -38,16 +38,16 @@ func (l limitsMiddleware) Do(ctx context.Context, r tripperware.Request) (trippe
 	log, ctx := spanlogger.New(ctx, "limits")
 	defer log.Finish()
 
-	tenantIDs, err := tenant.TenantIDs(ctx)
+	tenantIDs, err := users.TenantIDs(ctx)
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	// Enforce the max query length.
 	if maxQueryLength := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, l.MaxQueryLength); maxQueryLength > 0 {
-		expr, err := parser.ParseExpr(r.GetQuery())
+		expr, err := cortexparser.ParseExpr(r.GetQuery())
 		if err != nil {
-			return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 		}
 
 		// Enforce query length across all selectors in the query.

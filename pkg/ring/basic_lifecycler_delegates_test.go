@@ -69,22 +69,23 @@ func TestTokensPersistencyDelegate_ShouldSkipTokensLoadingIfFileDoesNotExist(t *
 	require.NoError(t, services.StopAndAwaitTerminated(ctx, lifecycler))
 
 	// Ensure tokens have been stored.
-	actualTokens, err := LoadTokensFromFile(tokensFile.Name())
+	tokenFile, err := LoadTokenFile(tokensFile.Name())
 	require.NoError(t, err)
-	assert.Equal(t, Tokens{1, 2, 3, 4, 5}, actualTokens)
+	assert.Equal(t, Tokens{1, 2, 3, 4, 5}, tokenFile.Tokens)
 
 	// Ensure no error has been logged.
 	assert.Empty(t, logs.String())
 }
 
-func TestTokensPersistencyDelegate_ShouldLoadTokensFromFileIfFileExist(t *testing.T) {
+func TestTokensPersistencyDelegate_ShouldLoadTokenFileIfFileExist(t *testing.T) {
 	tokensFile, err := os.CreateTemp("", "tokens-*")
 	require.NoError(t, err)
 	defer os.Remove(tokensFile.Name()) //nolint:errcheck
 
 	// Store some tokens to the file.
 	storedTokens := Tokens{6, 7, 8, 9, 10}
-	require.NoError(t, storedTokens.StoreToFile(tokensFile.Name()))
+	tokenFile1 := TokenFile{Tokens: storedTokens}
+	require.NoError(t, tokenFile1.StoreToFile(tokensFile.Name()))
 
 	testDelegate := &mockDelegate{
 		onRegister: func(lifecycler *BasicLifecycler, ringDesc Desc, instanceExists bool, instanceID string, instanceDesc InstanceDesc) (InstanceState, Tokens) {
@@ -113,9 +114,9 @@ func TestTokensPersistencyDelegate_ShouldLoadTokensFromFileIfFileExist(t *testin
 	require.NoError(t, services.StopAndAwaitTerminated(ctx, lifecycler))
 
 	// Ensure we can still read back the tokens file.
-	actualTokens, err := LoadTokensFromFile(tokensFile.Name())
+	tokenFile, err := LoadTokenFile(tokensFile.Name())
 	require.NoError(t, err)
-	assert.Equal(t, storedTokens, actualTokens)
+	assert.Equal(t, storedTokens, tokenFile.Tokens)
 }
 
 func TestTokensPersistencyDelegate_ShouldHandleTheCaseTheInstanceIsAlreadyInTheRing(t *testing.T) {
@@ -150,7 +151,8 @@ func TestTokensPersistencyDelegate_ShouldHandleTheCaseTheInstanceIsAlreadyInTheR
 			defer os.Remove(tokensFile.Name()) //nolint:errcheck
 
 			// Store some tokens to the file.
-			require.NoError(t, storedTokens.StoreToFile(tokensFile.Name()))
+			tokenFile1 := TokenFile{Tokens: storedTokens}
+			require.NoError(t, tokenFile1.StoreToFile(tokensFile.Name()))
 
 			// We assume is already registered to the ring.
 			registeredAt := time.Now().Add(-time.Hour)
@@ -170,7 +172,7 @@ func TestTokensPersistencyDelegate_ShouldHandleTheCaseTheInstanceIsAlreadyInTheR
 			defer services.StopAndAwaitTerminated(ctx, lifecycler) //nolint:errcheck
 
 			// Add the instance to the ring.
-			require.NoError(t, store.CAS(ctx, testRingKey, func(in interface{}) (out interface{}, retry bool, err error) {
+			require.NoError(t, store.CAS(ctx, testRingKey, func(in any) (out any, retry bool, err error) {
 				ringDesc := NewDesc()
 				ringDesc.AddIngester(cfg.ID, cfg.Addr, cfg.Zone, testData.initialTokens, testData.initialState, registeredAt)
 				return ringDesc, true, nil
@@ -226,9 +228,9 @@ func TestDelegatesChain(t *testing.T) {
 	assert.True(t, onStoppingCalled)
 
 	// Ensure tokens have been stored.
-	actualTokens, err := LoadTokensFromFile(tokensFile.Name())
+	tokenFile, err := LoadTokenFile(tokensFile.Name())
 	require.NoError(t, err)
-	assert.Equal(t, Tokens{1, 2, 3, 4, 5}, actualTokens)
+	assert.Equal(t, Tokens{1, 2, 3, 4, 5}, tokenFile.Tokens)
 }
 
 func TestAutoForgetDelegate(t *testing.T) {
@@ -276,7 +278,7 @@ func TestAutoForgetDelegate(t *testing.T) {
 			require.NoError(t, err)
 
 			// Setup the initial state of the ring.
-			require.NoError(t, store.CAS(ctx, testRingKey, func(in interface{}) (out interface{}, retry bool, err error) {
+			require.NoError(t, store.CAS(ctx, testRingKey, func(in any) (out any, retry bool, err error) {
 				ringDesc := NewDesc()
 				testData.setup(ringDesc)
 				return ringDesc, true, nil
@@ -287,7 +289,7 @@ func TestAutoForgetDelegate(t *testing.T) {
 			defer services.StopAndAwaitTerminated(ctx, lifecycler) //nolint:errcheck
 
 			// Wait until an heartbeat has been sent.
-			test.Poll(t, time.Second, true, func() interface{} {
+			test.Poll(t, time.Second, true, func() any {
 				return testutil.ToFloat64(lifecycler.metrics.heartbeats) > 0
 			})
 

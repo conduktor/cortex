@@ -38,19 +38,49 @@ var SyncRingOp = ring.NewOp([]ring.InstanceState{ring.ACTIVE, ring.JOINING}, fun
 	return s != ring.ACTIVE
 })
 
+// Blast radius limited ring operations (with extension disabled)
+var RingOpNoExtension = ring.NewOp([]ring.InstanceState{ring.ACTIVE}, func(s ring.InstanceState) bool {
+	// Never extend replica set to limit blast radius during config corruption incidents
+	return false
+})
+
+var SyncRingOpNoExtension = ring.NewOp([]ring.InstanceState{ring.ACTIVE, ring.JOINING}, func(s ring.InstanceState) bool {
+	// Never extend replica set during sync to limit blast radius during config corruption incidents
+	return false
+})
+
+// Helper functions to select the appropriate ring operation based on config
+func getRingOp(disableExtension bool) ring.Operation {
+	if disableExtension {
+		return RingOpNoExtension
+	}
+	return RingOp
+}
+
+func getSyncRingOp(disableExtension bool) ring.Operation {
+	if disableExtension {
+		return SyncRingOpNoExtension
+	}
+	return SyncRingOp
+}
+
 // RingConfig masks the ring lifecycler config which contains
 // many options not really required by the alertmanager ring. This config
 // is used to strip down the config to the minimum, and avoid confusion
 // to the user.
 type RingConfig struct {
-	KVStore              kv.Config     `yaml:"kvstore" doc:"description=The key-value store used to share the hash ring across multiple instances."`
-	HeartbeatPeriod      time.Duration `yaml:"heartbeat_period"`
-	HeartbeatTimeout     time.Duration `yaml:"heartbeat_timeout"`
-	ReplicationFactor    int           `yaml:"replication_factor"`
-	ZoneAwarenessEnabled bool          `yaml:"zone_awareness_enabled"`
+	KVStore                    kv.Config     `yaml:"kvstore" doc:"description=The key-value store used to share the hash ring across multiple instances."`
+	HeartbeatPeriod            time.Duration `yaml:"heartbeat_period"`
+	HeartbeatTimeout           time.Duration `yaml:"heartbeat_timeout"`
+	ReplicationFactor          int           `yaml:"replication_factor"`
+	ZoneAwarenessEnabled       bool          `yaml:"zone_awareness_enabled"`
+	TokensFilePath             string        `yaml:"tokens_file_path"`
+	DetailedMetricsEnabled     bool          `yaml:"detailed_metrics_enabled"`
+	DisableReplicaSetExtension bool          `yaml:"disable_replica_set_extension"`
 
-	FinalSleep               time.Duration `yaml:"final_sleep"`
-	WaitInstanceStateTimeout time.Duration `yaml:"wait_instance_state_timeout"`
+	FinalSleep                      time.Duration `yaml:"final_sleep"`
+	WaitInstanceStateTimeout        time.Duration `yaml:"wait_instance_state_timeout"`
+	KeepInstanceInTheRingOnShutdown bool          `yaml:"keep_instance_in_the_ring_on_shutdown"`
 
 	// Instance details
 	InstanceID             string   `yaml:"instance_id" doc:"hidden"`
@@ -85,6 +115,9 @@ func (cfg *RingConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.FinalSleep, rfprefix+"final-sleep", 0*time.Second, "The sleep seconds when alertmanager is shutting down. Need to be close to or larger than KV Store information propagation delay")
 	f.IntVar(&cfg.ReplicationFactor, rfprefix+"replication-factor", 3, "The replication factor to use when sharding the alertmanager.")
 	f.BoolVar(&cfg.ZoneAwarenessEnabled, rfprefix+"zone-awareness-enabled", false, "True to enable zone-awareness and replicate alerts across different availability zones.")
+	f.StringVar(&cfg.TokensFilePath, rfprefix+"tokens-file-path", "", "File path where tokens are stored. If empty, tokens are not stored at shutdown and restored at startup.")
+	f.BoolVar(&cfg.DetailedMetricsEnabled, rfprefix+"detailed-metrics-enabled", true, "Set to true to enable ring detailed metrics. These metrics provide detailed information, such as token count and ownership per tenant. Disabling them can significantly decrease the number of metrics emitted.")
+	f.BoolVar(&cfg.DisableReplicaSetExtension, rfprefix+"disable-replica-set-extension", false, "Disable extending the replica set when instances are unhealthy. This limits blast radius during config corruption incidents but reduces availability during normal failures.")
 
 	// Instance flags
 	cfg.InstanceInterfaceNames = []string{"eth0", "en0"}
@@ -93,6 +126,7 @@ func (cfg *RingConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.InstancePort, rfprefix+"instance-port", 0, "Port to advertise in the ring (defaults to server.grpc-listen-port).")
 	f.StringVar(&cfg.InstanceID, rfprefix+"instance-id", hostname, "Instance ID to register in the ring.")
 	f.StringVar(&cfg.InstanceZone, rfprefix+"instance-availability-zone", "", "The availability zone where this instance is running. Required if zone-awareness is enabled.")
+	f.BoolVar(&cfg.KeepInstanceInTheRingOnShutdown, rfprefix+"keep-instance-in-the-ring-on-shutdown", false, "Keep instance in the ring on shut down.")
 
 	cfg.RingCheckPeriod = 5 * time.Second
 
@@ -111,13 +145,14 @@ func (cfg *RingConfig) ToLifecyclerConfig(logger log.Logger) (ring.BasicLifecycl
 	instancePort := ring.GetInstancePort(cfg.InstancePort, cfg.ListenPort)
 
 	return ring.BasicLifecyclerConfig{
-		ID:                  cfg.InstanceID,
-		Addr:                fmt.Sprintf("%s:%d", instanceAddr, instancePort),
-		HeartbeatPeriod:     cfg.HeartbeatPeriod,
-		TokensObservePeriod: 0,
-		Zone:                cfg.InstanceZone,
-		NumTokens:           RingNumTokens,
-		FinalSleep:          cfg.FinalSleep,
+		ID:                              cfg.InstanceID,
+		Addr:                            fmt.Sprintf("%s:%d", instanceAddr, instancePort),
+		HeartbeatPeriod:                 cfg.HeartbeatPeriod,
+		TokensObservePeriod:             0,
+		Zone:                            cfg.InstanceZone,
+		NumTokens:                       RingNumTokens,
+		FinalSleep:                      cfg.FinalSleep,
+		KeepInstanceInTheRingOnShutdown: cfg.KeepInstanceInTheRingOnShutdown,
 	}, nil
 }
 
@@ -129,6 +164,7 @@ func (cfg *RingConfig) ToRingConfig() ring.Config {
 	rc.HeartbeatTimeout = cfg.HeartbeatTimeout
 	rc.ReplicationFactor = cfg.ReplicationFactor
 	rc.ZoneAwarenessEnabled = cfg.ZoneAwarenessEnabled
+	rc.DetailedMetricsEnabled = cfg.DetailedMetricsEnabled
 
 	return rc
 }
