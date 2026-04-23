@@ -1,6 +1,6 @@
 module github.com/cortexproject/cortex
 
-go 1.24.0
+go 1.25.9
 
 require (
 	github.com/Masterminds/squirrel v1.5.4
@@ -337,3 +337,6 @@ exclude github.com/envoyproxy/go-control-plane/envoy v1.32.3
 
 // TODO: update it in next PR
 replace github.com/prometheus/otlptranslator => github.com/prometheus/otlptranslator v0.0.0-20250620074007-94f535e0c588
+
+// Conduktor fork of Prometheus
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.306.1-0.20260423151435-901a46dd9bee
