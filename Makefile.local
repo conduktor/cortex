@@ -1,0 +1,2 @@
+BUILD_IMAGE ?= harbor.cdkt.dev/conduktor/cortex/build-image
+IMAGE_PREFIX ?= harbor.cdkt.dev/conduktor/cortex/
