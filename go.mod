@@ -350,4 +350,4 @@ replace github.com/prometheus/otlptranslator => github.com/prometheus/otlptransl
 
 // Use Conduktor fork of prometheus based on branch cdk-3.8
 // to update run `go get github.com/conduktor/prometheus@cdk-3.8`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20260427114916-6c1a5d39a237
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20260430082522-3b9b9a7a9b15
