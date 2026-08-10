@@ -36,6 +36,7 @@ type tcIntegrationClientServer struct {
 }
 
 type grpcHealthCheck struct {
+	grpc_health_v1.UnimplementedHealthServer
 	healthy bool
 }
 
@@ -100,7 +101,7 @@ func newIntegrationClientServer(
 		fmt.Fprintf(w, "OK")
 	})
 
-	grpc_health_v1.RegisterHealthServer(serv.GRPC, &grpcHealthCheck{true})
+	grpc_health_v1.RegisterHealthServer(serv.GRPC, &grpcHealthCheck{healthy: true})
 
 	go func() {
 		err := serv.Run()
