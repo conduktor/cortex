@@ -1,6 +1,6 @@
 module github.com/cortexproject/cortex
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/Masterminds/squirrel v1.5.4
@@ -65,8 +65,8 @@ require (
 	go.opentelemetry.io/otel/sdk v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
 	go.uber.org/atomic v1.11.0
-	golang.org/x/net v0.58.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/net v0.61.0
+	golang.org/x/sync v0.24.0
 	golang.org/x/time v0.14.0
 	google.golang.org/grpc v1.83.2
 	gopkg.in/yaml.v2 v2.4.0
@@ -294,13 +294,13 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go4.org/intern v0.0.0-20230525184215-6c62f75575cb // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20231121144256-b99613f794b6 // indirect
-	golang.org/x/crypto v0.56.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20250808145144-a408d31f581a // indirect
-	golang.org/x/mod v0.38.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/tools v0.48.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/api v0.264.0 // indirect
 	google.golang.org/genproto v0.0.0-20260128011058-8636f8732409 // indirect
@@ -350,4 +350,4 @@ replace github.com/prometheus/otlptranslator => github.com/prometheus/otlptransl
 
 // Use Conduktor fork of prometheus based on branch cdk-3.8
 // to update run `go get github.com/conduktor/prometheus@cdk-3.8`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20260921103222-bd666b483eaf
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20261012093159-7d37659ce76d
