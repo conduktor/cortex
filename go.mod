@@ -1,6 +1,6 @@
 module github.com/cortexproject/cortex
 
-go 1.26.9
+go 1.26.11
 
 require (
 	github.com/Masterminds/squirrel v1.5.4
@@ -30,7 +30,7 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.7
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/json-iterator/go v1.1.12
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.20.2
 	github.com/lib/pq v1.11.2 // indirect
 	github.com/minio/minio-go/v7 v7.0.98
 	github.com/mitchellh/go-wordwrap v1.0.1
@@ -118,7 +118,7 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.54.0 // indirect
 	github.com/VictoriaMetrics/easyproto v0.1.4 // indirect
 	github.com/alecthomas/kingpin/v2 v2.4.0 // indirect
-	github.com/andybalholm/brotli v1.1.1 // indirect
+	github.com/andybalholm/brotli v1.2.7 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.7 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.17 // indirect
@@ -157,7 +157,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-chi/chi/v5 v5.3.0 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -350,4 +350,4 @@ replace github.com/prometheus/otlptranslator => github.com/prometheus/otlptransl
 
 // Use Conduktor fork of prometheus based on branch cdk-3.8
 // to update run `go get github.com/conduktor/prometheus@cdk-3.8`
-replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20261012093159-7d37659ce76d
+replace github.com/prometheus/prometheus => github.com/conduktor/prometheus v0.308.2-0.20261117125518-6fde204b8bb0
